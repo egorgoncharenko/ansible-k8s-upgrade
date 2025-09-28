@@ -1,0 +1,19 @@
+# Целевая минорная версия (репозиторий будет только под неё)
+k8s_target: "v1.34.0" 
+
+
+
+# кто выполняет kubectl drain/uncordon
+k8s_ctl_host: "{{ groups['masters'][0] }}"
+
+# имена нод в кластере (по умолчанию как в inventory)
+k8s_node_name: "{{ inventory_hostname }}"
+
+# CRI: containerd
+cri_socket: "unix:///run/containerd/containerd.sock"
+configure_containerd: true
+pause_image: "registry.k8s.io/pause:3.10"
+
+# таймауты
+drain_timeout: "15m"
+wait_ready_timeout: "600s"
