@@ -1,0 +1,268 @@
+---
+# 0) PRECHECKS: базовые проверки с первого мастера
+- name: Prechecks (kubectl/cilium)
+  hosts: masters[0]
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Check kubectl
+      shell: >
+        kubectl version --client -o=yaml 2>/dev/null
+        || kubectl version --client=true 2>/dev/null
+        || kubectl version 2>/dev/null
+      register: kubectl_ver
+      changed_when: false
+      failed_when: false
+
+    - debug:
+        var: kubectl_ver.stdout
+
+    # - name: Optional — check Cilium status
+    #   shell: "cilium status --wait 1m || true"
+    #   register: cilium_status
+    #   changed_when: false
+    #   failed_when: false
+
+    # - name: Warn if Cilium not OK
+    #   debug:
+    #     msg: "WARNING: Cilium не OK. Приведи его в норму перед апгрейдом."
+    #   when: "'OK' not in cilium_status.stdout"
+
+# 1) (ОПЦИОНАЛЬНО) автодетект k8s_node_name по INTERNAL-IP, если имена в k8s ≠ inventory
+- name: Autodetect k8s_node_name by InternalIP
+  hosts: "masters:workers"
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Find k8s node name by ansible_host IP
+      command: >-
+        bash -lc "kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{range .status.addresses[?(@.type==\"InternalIP\")]}{.address}{\"\\n\"}{end}{end}' |
+        awk '$2==\"{{ ansible_host }}\" {print $1}'"
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: node_name_cmd
+      changed_when: false
+      failed_when: false
+      when: (auto_detect_node_name | default(true)) | bool
+
+    - name: Set fact k8s_node_name when detected
+      set_fact:
+        k8s_node_name: "{{ node_name_cmd.stdout | trim }}"
+      when:
+        - (auto_detect_node_name | default(true)) | bool
+        - (node_name_cmd.stdout | trim) != ""
+
+# 2) Настраиваем APT-репозиторий Kubernetes для v1.34 на всех нодах
+- name: Configure Kubernetes apt repo (v1.34) on all nodes
+  hosts: "masters:workers"
+  become: true
+  tasks:
+    - name: Install apt prerequisites
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gpg
+        state: present
+        update_cache: yes
+
+    - name: Ensure keyrings dir exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Kubernetes apt key for {{ k8s_minor }}
+      shell: |
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/Release.key \
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Configure Kubernetes apt source (minor-pinned)
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/ /"
+
+    - name: apt update
+      apt:
+        update_cache: yes
+
+# 3) Приводим CONTAINERD в рекомендуемое состояние (CRI включён, SystemdCgroup, pause-образ)
+- name: Ensure containerd is ready for Kubernetes
+  hosts: "masters:workers"
+  become: true
+  handlers:
+    - name: restart containerd
+      service:
+        name: containerd
+        state: restarted
+  tasks:
+    - block:
+        - name: Install containerd
+          apt:
+            name: containerd
+            state: present
+            update_cache: yes
+
+        - name: Create default config if missing
+          shell: "test -f /etc/containerd/config.toml || containerd config default > /etc/containerd/config.toml"
+          args:
+            creates: /etc/containerd/config.toml
+
+        - name: Enforce SystemdCgroup=true
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: '^\s*SystemdCgroup\s*=\s*false'
+            replace: 'SystemdCgroup = true'
+          notify: restart containerd
+
+        - name: Set pause image
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: '^\s*sandbox_image\s*=\s*".*"'
+            replace: 'sandbox_image = "{{ pause_image }}"'
+          notify: restart containerd
+
+        - name: Fail if CRI plugin disabled
+          shell: "grep -E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
+          register: cri_disabled
+          changed_when: false
+
+        - name: Abort when CRI plugin disabled in containerd
+          fail:
+            msg: 'В /etc/containerd/config.toml отключён CRI (disabled_plugins содержит "cri"). Убери "cri" и запусти снова.'
+          when: cri_disabled.stdout == "BAD"
+
+        - name: Configure crictl to containerd socket
+          copy:
+            dest: /etc/crictl.yaml
+            mode: '0644'
+            content: |
+              runtime-endpoint: {{ cri_socket }}
+              image-endpoint: {{ cri_socket }}
+
+        - name: Ensure containerd is active
+          shell: "systemctl is-active containerd"
+          register: cact
+          changed_when: false
+      when: (configure_containerd | default(true)) | bool
+
+# 4) Апгрейд CONTROL-PLANE (по одной ноде)
+- name: Upgrade control-plane nodes (serial=1)
+  hosts: masters
+  serial: 1
+  become: true
+  tasks:
+    - name: Drain control-plane node
+      command: >
+        kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+        --ignore-daemonsets --delete-emptydir-data
+        --grace-period=60 --timeout={{ drain_timeout }}
+      delegate_to: "{{ k8s_ctl_host }}"
+
+    - name: Unhold kube packages
+      shell: "apt-mark unhold kubeadm kubelet kubectl || true"
+
+    - name: Install latest kubeadm from v1.34 repo
+      apt:
+        name: kubeadm
+        state: latest
+        update_cache: yes
+
+    - name: kubeadm upgrade (apply on first master, node on others)
+      command: >-
+        {{ 'kubeadm upgrade apply ' ~ k8s_target
+           if inventory_hostname == groups['masters'][0]
+           else 'kubeadm upgrade node' }}
+  
+      register: kubeadm_upgrade
+      changed_when: kubeadm_upgrade.rc == 0
+
+    - name: Install latest kubelet/kubectl from v1.34 repo
+      apt:
+        name:
+          - kubelet
+          - kubectl
+        state: latest
+        update_cache: yes
+
+    - name: Hold kube packages
+      shell: "apt-mark hold kubeadm kubelet kubectl"
+
+    - name: systemd daemon-reexec
+      command: systemctl daemon-reexec
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted
+        enabled: true
+
+    - name: Wait node Ready
+      command: >
+        kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
+        --for=condition=Ready --timeout={{ wait_ready_timeout }}
+      delegate_to: "{{ k8s_ctl_host }}"
+
+    - name: Uncordon control-plane node
+      command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
+      delegate_to: "{{ k8s_ctl_host }}"
+
+# 5) Апгрейд WORKER-нод (по одной)
+- name: Upgrade worker nodes (serial=1)
+  hosts: workers
+  serial: 1
+  become: true
+  tasks:
+    - name: Drain worker node
+      command: >
+        kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+        --ignore-daemonsets --delete-emptydir-data
+        --grace-period=60 --timeout={{ drain_timeout }}
+      delegate_to: "{{ k8s_ctl_host }}"
+
+    - name: Unhold kube packages
+      shell: "apt-mark unhold kubeadm kubelet kubectl || true"
+
+    - name: Install latest kubeadm from v1.34 repo
+      apt:
+        name: kubeadm
+        state: latest
+        update_cache: yes
+
+    - name: kubeadm upgrade node (workers)
+      command: kubeadm upgrade node 
+      register: kubeadm_node_upgrade
+      changed_when: kubeadm_node_upgrade.rc == 0
+
+    - name: Install latest kubelet/kubectl from v1.34 repo
+      apt:
+        name:
+          - kubelet
+          - kubectl
+        state: latest
+        update_cache: yes
+
+    - name: Hold kube packages
+      shell: "apt-mark hold kubeadm kubelet kubectl"
+
+    - name: systemd daemon-reexec
+      command: systemctl daemon-reexec
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted
+        enabled: true
+
+    - name: Wait node Ready
+      command: >
+        kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
+        --for=condition=Ready --timeout={{ wait_ready_timeout }}
+      delegate_to: "{{ k8s_ctl_host }}"
+
+    - name: Uncordon worker node
+      command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
+      delegate_to: "{{ k8s_ctl_host }}"
