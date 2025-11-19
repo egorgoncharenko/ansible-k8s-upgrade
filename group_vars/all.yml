@@ -1,19 +1,55 @@
-# Целевая минорная версия (репозиторий будет только под неё)
-k8s_target: "v1.34.0" 
+# ========================================
+# Переменные для апгрейда Kubernetes кластера
+# ========================================
 
+# Целевая версия кластера (патч-точно)
+# ВАЖНО: Проверьте актуальную версию на https://kubernetes.io/releases/
+k8s_target: "v1.31.3"
 
+# Минор для репозитория pkgs.k8s.io (автоизвлечение из k8s_target: v1.31)
+k8s_minor: "{{ k8s_target | regex_search('^v\\d+\\.\\d+') }}"
 
-# кто выполняет kubectl drain/uncordon
+# Кто выполняет kubectl drain/uncordon
 k8s_ctl_host: "{{ groups['masters'][0] }}"
 
-# имена нод в кластере (по умолчанию как в inventory)
+# Имена нод в кластере (если совпадают с inventory)
 k8s_node_name: "{{ inventory_hostname }}"
 
-# CRI: containerd
+# Если имена в Kubernetes ≠ inventory, включай автодетект
+# Установи в true и плейбук автоматически найдет имена нод по IP
+auto_detect_node_name: false
+
+# ========================================
+# CRI настройки: containerd
+# ========================================
 cri_socket: "unix:///run/containerd/containerd.sock"
 configure_containerd: true
+
+# Pause image для containerd
+# Проверьте актуальную версию: https://github.com/kubernetes/kubernetes/blob/master/build/pause/CHANGELOG.md
 pause_image: "registry.k8s.io/pause:3.10"
 
-# таймауты
+# ========================================
+# Таймауты операций
+# ========================================
+
+# Таймаут для kubectl drain (эвакуация подов с ноды)
+# Увеличьте если у вас много подов или большие PDB
 drain_timeout: "15m"
-wait_ready_timeout: "600s"
+
+# Таймаут ожидания состояния Ready после рестарта kubelet
+# Увеличьте для медленных нод или больших кластеров
+wait_ready_timeout: "10m"
+
+# ========================================
+# Дополнительные опции (раскомментируйте при необходимости)
+# ========================================
+
+# Пропустить финальную паузу с подтверждением
+# skip_final_confirmation: false
+
+# Включить verbose вывод kubeadm
+# kubeadm_verbosity: 5
+
+# Дополнительные флаги для kubectl drain
+# drain_extra_flags: "--force"

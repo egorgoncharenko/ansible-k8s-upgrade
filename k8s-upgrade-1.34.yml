@@ -1,35 +1,90 @@
 ---
-# 0) PRECHECKS: базовые проверки с первого мастера
-- name: Prechecks (kubectl/cilium)
+# ===================== 0) PRECHECKS: базовые проверки с первого мастера =====================
+- name: Prechecks (kubectl доступ)
   hosts: masters[0]
   gather_facts: false
-  become: true
+  become: false
   tasks:
-    - name: Check kubectl
+    - name: Validate k8s_target format (vX.Y.Z)
+      assert:
+        that:
+          - k8s_target is match('^v\\d+\\.\\d+\\.\\d+$')
+        fail_msg: "k8s_target должен быть вида vX.Y.Z, сейчас: {{ k8s_target }}"
+
+    - name: Check kubectl present and usable
       shell: >
         kubectl version --client -o=yaml 2>/dev/null
         || kubectl version --client=true 2>/dev/null
         || kubectl version 2>/dev/null
       register: kubectl_ver
       changed_when: false
-      failed_when: false
+      failed_when: kubectl_ver.rc != 0
 
     - debug:
         var: kubectl_ver.stdout
 
-    # - name: Optional — check Cilium status
+    - name: Get current cluster version
+      shell: kubectl version -o json | jq -r '.serverVersion.gitVersion'
+      register: current_k8s_version
+      changed_when: false
+      failed_when: current_k8s_version.rc != 0
+
+    - name: Parse version numbers for validation
+      set_fact:
+        current_minor: "{{ current_k8s_version.stdout.split('.')[1] | int }}"
+        target_minor: "{{ k8s_target.split('.')[1] | int }}"
+
+    - name: Validate upgrade path (max +1 minor version jump)
+      assert:
+        that:
+          - (target_minor | int) - (current_minor | int) <= 1
+          - (target_minor | int) - (current_minor | int) >= 0
+        fail_msg: |
+          ОШИБКА: Нельзя перепрыгивать минорные версии!
+          Текущая версия: {{ current_k8s_version.stdout }}
+          Целевая версия: {{ k8s_target }}
+          Разница минорных версий: {{ (target_minor | int) - (current_minor | int) }}
+          
+          Kubernetes можно апгрейдить только на +1 минорную версию за раз.
+          Например: 1.30.x → 1.31.x (OK), но 1.29.x → 1.31.x (ОШИБКА)
+
+    - name: Check all nodes are Ready before upgrade
+      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      register: not_ready_nodes
+      changed_when: false
+      failed_when: not_ready_nodes.stdout != "0"
+
+    - name: Display current cluster state
+      shell: kubectl get nodes -o wide
+      register: nodes_state
+      changed_when: false
+
+    - debug:
+        msg: "{{ nodes_state.stdout_lines }}"
+
+    - name: Confirm upgrade readiness
+      pause:
+        prompt: |
+          
+          ========================================
+          Готов к апгрейду кластера!
+          Текущая версия: {{ current_k8s_version.stdout }}
+          Целевая версия: {{ k8s_target }}
+          ========================================
+          
+          ⚠️  ВАЖНО: Убедитесь что сделан бэкап etcd!
+          
+          Нажмите Enter для продолжения или Ctrl+C для отмены...
+
+    # Опциональная проверка Cilium
+    # - name: cilium status (optional)
     #   shell: "cilium status --wait 1m || true"
     #   register: cilium_status
     #   changed_when: false
     #   failed_when: false
 
-    # - name: Warn if Cilium not OK
-    #   debug:
-    #     msg: "WARNING: Cilium не OK. Приведи его в норму перед апгрейдом."
-    #   when: "'OK' not in cilium_status.stdout"
-
-# 1) (ОПЦИОНАЛЬНО) автодетект k8s_node_name по INTERNAL-IP, если имена в k8s ≠ inventory
-- name: Autodetect k8s_node_name by InternalIP
+# ============ 1) (ОПЦИОНАЛЬНО) автодетект k8s_node_name по InternalIP ============
+- name: Autodetect k8s_node_name by InternalIP (если нужно)
   hosts: "masters:workers"
   gather_facts: false
   become: false
@@ -42,19 +97,31 @@
       register: node_name_cmd
       changed_when: false
       failed_when: false
-      when: (auto_detect_node_name | default(true)) | bool
+      when: (auto_detect_node_name | default(false)) | bool
 
     - name: Set fact k8s_node_name when detected
       set_fact:
         k8s_node_name: "{{ node_name_cmd.stdout | trim }}"
       when:
-        - (auto_detect_node_name | default(true)) | bool
+        - (auto_detect_node_name | default(false)) | bool
         - (node_name_cmd.stdout | trim) != ""
 
-# 2) Настраиваем APT-репозиторий Kubernetes для v1.34 на всех нодах
-- name: Configure Kubernetes apt repo (v1.34) on all nodes
+    - name: Validate k8s_node_name is set
+      assert:
+        that:
+          - k8s_node_name is defined
+          - k8s_node_name | length > 0
+        fail_msg: "k8s_node_name не установлен для {{ inventory_hostname }}"
+
+# ======= 2) Настроить APT-репозиторий Kubernetes (minor-pinned) на всех нодах =======
+- name: Configure Kubernetes apt repo on all nodes
   hosts: "masters:workers"
   become: true
+  pre_tasks:
+    - name: Ensure k8s_minor is set (derive from k8s_target if absent)
+      set_fact:
+        k8s_minor: "{{ k8s_target | regex_search('^v\\d+\\.\\d+') }}"
+      when: k8s_minor is not defined
   tasks:
     - name: Install apt prerequisites
       apt:
@@ -63,6 +130,7 @@
           - ca-certificates
           - curl
           - gpg
+          - jq
         state: present
         update_cache: yes
 
@@ -72,7 +140,7 @@
         state: directory
         mode: '0755'
 
-    - name: Add Kubernetes apt key for {{ k8s_minor }}
+    - name: Add Kubernetes apt key
       shell: |
         curl -fsSL https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/Release.key \
         | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
@@ -89,7 +157,7 @@
       apt:
         update_cache: yes
 
-# 3) Приводим CONTAINERD в рекомендуемое состояние (CRI включён, SystemdCgroup, pause-образ)
+# === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
 - name: Ensure containerd is ready for Kubernetes
   hosts: "masters:workers"
   become: true
@@ -111,18 +179,18 @@
           args:
             creates: /etc/containerd/config.toml
 
-        - name: Enforce SystemdCgroup=true
+        - name: Enforce SystemdCgroup=true (uncomment/flip if needed)
           replace:
             path: /etc/containerd/config.toml
             regexp: '^\s*SystemdCgroup\s*=\s*false'
-            replace: 'SystemdCgroup = true'
+            replace: '          SystemdCgroup = true'
           notify: restart containerd
 
         - name: Set pause image
           replace:
             path: /etc/containerd/config.toml
             regexp: '^\s*sandbox_image\s*=\s*".*"'
-            replace: 'sandbox_image = "{{ pause_image }}"'
+            replace: '    sandbox_image = "{{ pause_image }}"'
           notify: restart containerd
 
         - name: Fail if CRI plugin disabled
@@ -147,46 +215,86 @@
           shell: "systemctl is-active containerd"
           register: cact
           changed_when: false
+          failed_when: cact.stdout != "active"
       when: (configure_containerd | default(true)) | bool
 
-# 4) Апгрейд CONTROL-PLANE (по одной ноде)
+# ================= 4) Апгрейд CONTROL-PLANE (по одной ноде) =================
 - name: Upgrade control-plane nodes (serial=1)
   hosts: masters
   serial: 1
   become: true
   tasks:
+    - name: Pre-upgrade node status check
+      command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: pre_node_status
+      changed_when: false
+
+    - debug:
+        msg: "Апгрейд ноды: {{ hostvars[inventory_hostname].k8s_node_name }}"
+
     - name: Drain control-plane node
       command: >
         kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
-      delegate_to: "{{ k8s_ctl_host }}"
+        --disable-eviction
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: drain_result
+      retries: 3
+      delay: 30
+      until: drain_result.rc == 0
+      failed_when: false
+
+    - name: Check if drain failed
+      fail:
+        msg: "Не удалось выполнить drain ноды {{ hostvars[inventory_hostname].k8s_node_name }} после 3 попыток"
+      when: drain_result.rc != 0
 
     - name: Unhold kube packages
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
-    - name: Install latest kubeadm from v1.34 repo
+    - name: Install kubeadm {{ k8s_target }} (pattern)
       apt:
-        name: kubeadm
-        state: latest
+        name: "kubeadm={{ k8s_target | regex_replace('^v','') }}-*"
+        state: present
         update_cache: yes
+        allow_downgrades: yes
 
-    - name: kubeadm upgrade (apply on first master, node on others)
-      command: >-
-        {{ 'kubeadm upgrade apply ' ~ k8s_target
-           if inventory_hostname == groups['masters'][0]
-           else 'kubeadm upgrade node' }}
-  
-      register: kubeadm_upgrade
-      changed_when: kubeadm_upgrade.rc == 0
+    - name: Verify kubeadm version
+      command: kubeadm version -o short
+      register: kubeadm_version_check
+      changed_when: false
 
-    - name: Install latest kubelet/kubectl from v1.34 repo
+    - debug:
+        msg: "Установлена версия kubeadm: {{ kubeadm_version_check.stdout }}"
+
+    - name: kubeadm config images pull (first master only)
+      command: kubeadm config images pull --kubernetes-version {{ k8s_target }}
+      when: inventory_hostname == groups['masters'][0]
+      register: images_pull
+      changed_when: images_pull.rc == 0
+
+    - name: kubeadm upgrade apply (first master with -y flag)
+      command: kubeadm upgrade apply {{ k8s_target }} -y
+      when: inventory_hostname == groups['masters'][0]
+      register: kubeadm_upgrade_apply
+      changed_when: kubeadm_upgrade_apply.rc == 0
+
+    - name: kubeadm upgrade node (other masters)
+      command: kubeadm upgrade node
+      when: inventory_hostname != groups['masters'][0]
+      register: kubeadm_upgrade_node
+      changed_when: kubeadm_upgrade_node.rc == 0
+
+    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
       apt:
         name:
-          - kubelet
-          - kubectl
-        state: latest
+          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
+          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
+        state: present
         update_cache: yes
+        allow_downgrades: yes
 
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
@@ -200,50 +308,98 @@
         state: restarted
         enabled: true
 
+    - name: Wait for kubelet to be active
+      shell: systemctl is-active kubelet
+      register: kubelet_active
+      retries: 10
+      delay: 5
+      until: kubelet_active.stdout == "active"
+      changed_when: false
+
     - name: Wait node Ready
       command: >
         kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
         --for=condition=Ready --timeout={{ wait_ready_timeout }}
-      delegate_to: "{{ k8s_ctl_host }}"
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: wait_ready
+      retries: 3
+      delay: 10
+      until: wait_ready.rc == 0
 
     - name: Uncordon control-plane node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
-      delegate_to: "{{ k8s_ctl_host }}"
+      delegate_to: "{{ groups['masters'][0] }}"
 
-# 5) Апгрейд WORKER-нод (по одной)
+    - name: Verify node version after upgrade
+      shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: post_upgrade_version
+      changed_when: false
+
+    - debug:
+        msg: "Нода {{ hostvars[inventory_hostname].k8s_node_name }} обновлена до версии: {{ post_upgrade_version.stdout }}"
+
+    - name: Pause between control-plane upgrades
+      pause:
+        seconds: 30
+        prompt: "Пауза 30 секунд перед следующим control-plane узлом..."
+
+# =================== 5) Апгрейд WORKER-нод (по одной) ===================
 - name: Upgrade worker nodes (serial=1)
   hosts: workers
   serial: 1
   become: true
   tasks:
+    - name: Pre-upgrade node status check
+      command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: pre_node_status
+      changed_when: false
+
+    - debug:
+        msg: "Апгрейд worker-ноды: {{ hostvars[inventory_hostname].k8s_node_name }}"
+
     - name: Drain worker node
       command: >
         kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
-      delegate_to: "{{ k8s_ctl_host }}"
+        --disable-eviction
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: drain_result
+      retries: 3
+      delay: 30
+      until: drain_result.rc == 0
+      failed_when: false
+
+    - name: Check if drain failed
+      fail:
+        msg: "Не удалось выполнить drain ноды {{ hostvars[inventory_hostname].k8s_node_name }} после 3 попыток"
+      when: drain_result.rc != 0
 
     - name: Unhold kube packages
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
-    - name: Install latest kubeadm from v1.34 repo
+    - name: Install kubeadm {{ k8s_target }} (pattern)
       apt:
-        name: kubeadm
-        state: latest
+        name: "kubeadm={{ k8s_target | regex_replace('^v','') }}-*"
+        state: present
         update_cache: yes
+        allow_downgrades: yes
 
     - name: kubeadm upgrade node (workers)
-      command: kubeadm upgrade node 
+      command: kubeadm upgrade node
       register: kubeadm_node_upgrade
       changed_when: kubeadm_node_upgrade.rc == 0
 
-    - name: Install latest kubelet/kubectl from v1.34 repo
+    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
       apt:
         name:
-          - kubelet
-          - kubectl
-        state: latest
+          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
+          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
+        state: present
         update_cache: yes
+        allow_downgrades: yes
 
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
@@ -257,12 +413,110 @@
         state: restarted
         enabled: true
 
+    - name: Wait for kubelet to be active
+      shell: systemctl is-active kubelet
+      register: kubelet_active
+      retries: 10
+      delay: 5
+      until: kubelet_active.stdout == "active"
+      changed_when: false
+
     - name: Wait node Ready
       command: >
         kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
         --for=condition=Ready --timeout={{ wait_ready_timeout }}
-      delegate_to: "{{ k8s_ctl_host }}"
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: wait_ready
+      retries: 3
+      delay: 10
+      until: wait_ready.rc == 0
 
     - name: Uncordon worker node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
-      delegate_to: "{{ k8s_ctl_host }}"
+      delegate_to: "{{ groups['masters'][0] }}"
+
+    - name: Verify node version after upgrade
+      shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
+      delegate_to: "{{ groups['masters'][0] }}"
+      register: post_upgrade_version
+      changed_when: false
+
+    - debug:
+        msg: "Worker-нода {{ hostvars[inventory_hostname].k8s_node_name }} обновлена до версии: {{ post_upgrade_version.stdout }}"
+
+    - name: Pause between worker upgrades
+      pause:
+        seconds: 20
+        prompt: "Пауза 20 секунд перед следующей worker-нодой..."
+
+# =================== 6) ФИНАЛЬНЫЕ ПРОВЕРКИ ===================
+- name: Final cluster health verification
+  hosts: masters[0]
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Wait for cluster to stabilize
+      pause:
+        seconds: 30
+        prompt: "Даём кластеру 30 секунд на стабилизацию..."
+
+    - name: Check all nodes are Ready
+      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      register: not_ready_final
+      changed_when: false
+      failed_when: not_ready_final.stdout != "0"
+
+    - name: Get all node versions
+      shell: kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
+      register: all_versions
+      changed_when: false
+
+    - debug:
+        msg: "{{ all_versions.stdout_lines }}"
+
+    - name: Verify all nodes on target version
+      shell: kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}' | tr ' ' '\n' | grep -v "{{ k8s_target }}" | wc -l
+      register: wrong_version_count
+      changed_when: false
+      failed_when: wrong_version_count.stdout != "0"
+
+    - name: Check cluster component status
+      command: kubectl get componentstatuses
+      register: component_status
+      changed_when: false
+      failed_when: false
+
+    - debug:
+        msg: "{{ component_status.stdout_lines }}"
+      when: component_status.rc == 0
+
+    - name: Get pods status across all namespaces
+      shell: kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded | tail -n +2 | wc -l
+      register: problematic_pods
+      changed_when: false
+
+    - name: Display final cluster state
+      command: kubectl get nodes -o wide
+      register: final_state
+      changed_when: false
+
+    - name: SUCCESS - Upgrade completed
+      debug:
+        msg:
+          - "=========================================="
+          - "✅ АПГРЕЙД ЗАВЕРШЁН УСПЕШНО!"
+          - "=========================================="
+          - "Целевая версия: {{ k8s_target }}"
+          - "Все ноды обновлены и в состоянии Ready"
+          - "Проблемных подов: {{ problematic_pods.stdout }}"
+          - ""
+          - "Финальное состояние кластера:"
+          - "{{ final_state.stdout }}"
+          - "=========================================="
+
+    - name: Warning about problematic pods
+      debug:
+        msg:
+          - "⚠️  ВНИМАНИЕ: Обнаружены поды не в Running/Succeeded статусе!"
+          - "Проверьте: kubectl get pods -A | grep -v Running | grep -v Completed"
+      when: problematic_pods.stdout != "0"
