@@ -1,0 +1,424 @@
+---
+# ============================================================================
+# Плейбук для обновления containerd 1.7.x → 2.0.x
+# ============================================================================
+
+- name: Pre-flight checks
+  hosts: masters[0]
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Check cluster is healthy
+      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      register: not_ready_nodes
+      changed_when: false
+      failed_when: not_ready_nodes.stdout != "0"
+
+    - name: Display cluster state
+      shell: kubectl get nodes -o wide
+      register: nodes_state
+      changed_when: false
+
+    - debug:
+        msg: "{{ nodes_state.stdout_lines }}"
+
+    - name: Confirm containerd upgrade
+      pause:
+        prompt: |
+          
+          ========================================
+          ОБНОВЛЕНИЕ CONTAINERD 1.7 → 2.0
+          ========================================
+          
+          Это обновит containerd на ВСЕХ нодах по очереди.
+          Каждая нода будет:
+          1. Drain (эвакуация подов)
+          2. Обновление containerd
+          3. Рестарт containerd + kubelet
+          4. Uncordon (возврат в работу)
+          
+          ⚠️  Процесс безопасен, но займёт время!
+          
+          Нажмите Enter для продолжения или Ctrl+C для отмены...
+
+# ============================================================================
+# Обновление containerd на CONTROL-PLANE нодах (по одной)
+# ============================================================================
+- name: Upgrade containerd on control-plane nodes
+  hosts: masters
+  serial: 1
+  become: true
+  tasks:
+    - name: Get current containerd version
+      shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
+      register: current_containerd
+      changed_when: false
+
+    - debug:
+        msg: "Текущая версия containerd на {{ inventory_hostname }}: {{ current_containerd.stdout }}"
+
+    - name: Check if upgrade needed
+      set_fact:
+        needs_upgrade: "{{ current_containerd.stdout.split('.')[0] | int < 2 }}"
+
+    - block:
+        - name: Drain node
+          command: >
+            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+            --ignore-daemonsets --delete-emptydir-data
+            --grace-period=60 --timeout=15m
+            --disable-eviction
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: drain_result
+          retries: 3
+          delay: 30
+          until: drain_result.rc == 0
+
+        - name: Stop kubelet
+          service:
+            name: kubelet
+            state: stopped
+
+        - name: Stop containerd
+          service:
+            name: containerd
+            state: stopped
+
+        - name: Backup containerd config
+          copy:
+            src: /etc/containerd/config.toml
+            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            remote_src: yes
+          when: ansible_facts.file_exists | default(false)
+
+        - name: Add Docker repository GPG key
+          shell: |
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+            chmod a+r /etc/apt/keyrings/docker.asc
+          args:
+            creates: /etc/apt/keyrings/docker.asc
+
+        - name: Add Docker repository
+          shell: |
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+          args:
+            creates: /etc/apt/sources.list.d/docker.list
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+
+        - name: Upgrade containerd to 2.0+
+          apt:
+            name: containerd.io
+            state: latest
+            update_cache: yes
+
+        - name: Verify new containerd version
+          shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
+          register: new_containerd
+          changed_when: false
+
+        - name: Check upgrade success
+          assert:
+            that:
+              - (new_containerd.stdout.split('.')[0] | int) >= 2
+            fail_msg: "Не удалось обновить containerd до 2.0+. Текущая версия: {{ new_containerd.stdout }}"
+            success_msg: "containerd успешно обновлён до {{ new_containerd.stdout }}"
+
+        - name: Regenerate default containerd config
+          shell: |
+            mv /etc/containerd/config.toml /etc/containerd/config.toml.old-1.7
+            containerd config default > /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml.old-1.7
+
+        - name: Ensure SystemdCgroup = true
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup\s*=\s*false'
+            replace: 'SystemdCgroup = true'
+
+        - name: Set correct pause image
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'sandbox_image\s*=\s*".*"'
+            replace: 'sandbox_image = "registry.k8s.io/pause:3.10"'
+
+        - name: Ensure CRI plugin is enabled
+          shell: "grep -E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
+          register: cri_check
+          changed_when: false
+          failed_when: cri_check.stdout == "BAD"
+
+        - name: Start containerd
+          service:
+            name: containerd
+            state: started
+            enabled: true
+
+        - name: Wait for containerd to be ready
+          shell: "ctr version || crictl version"
+          register: containerd_ready
+          retries: 10
+          delay: 3
+          until: containerd_ready.rc == 0
+          changed_when: false
+
+        - name: Start kubelet
+          service:
+            name: kubelet
+            state: started
+            enabled: true
+
+        - name: Wait for kubelet to be active
+          shell: systemctl is-active kubelet
+          register: kubelet_active
+          retries: 10
+          delay: 5
+          until: kubelet_active.stdout == "active"
+          changed_when: false
+
+        - name: Wait for node to be Ready
+          command: >
+            kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
+            --for=condition=Ready --timeout=10m
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: wait_ready
+          retries: 3
+          delay: 10
+          until: wait_ready.rc == 0
+
+        - name: Uncordon node
+          command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
+          delegate_to: "{{ groups['masters'][0] }}"
+
+        - debug:
+            msg: "✅ Нода {{ inventory_hostname }} обновлена: containerd {{ current_containerd.stdout }} → {{ new_containerd.stdout }}"
+
+        - name: Pause between control-plane nodes
+          pause:
+            seconds: 30
+            prompt: "Пауза 30 секунд перед следующей control-plane нодой..."
+      when: needs_upgrade | bool
+
+    - name: Skip if already on 2.0+
+      debug:
+        msg: "⏭️  Нода {{ inventory_hostname }} уже на containerd {{ current_containerd.stdout }}, пропускаем"
+      when: not (needs_upgrade | bool)
+
+# ============================================================================
+# Обновление containerd на WORKER нодах (по одной)
+# ============================================================================
+- name: Upgrade containerd on worker nodes
+  hosts: workers
+  serial: 1
+  become: true
+  tasks:
+    - name: Get current containerd version
+      shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
+      register: current_containerd
+      changed_when: false
+
+    - debug:
+        msg: "Текущая версия containerd на {{ inventory_hostname }}: {{ current_containerd.stdout }}"
+
+    - name: Check if upgrade needed
+      set_fact:
+        needs_upgrade: "{{ current_containerd.stdout.split('.')[0] | int < 2 }}"
+
+    - block:
+        - name: Drain node
+          command: >
+            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+            --ignore-daemonsets --delete-emptydir-data
+            --grace-period=60 --timeout=15m
+            --disable-eviction
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: drain_result
+          retries: 3
+          delay: 30
+          until: drain_result.rc == 0
+
+        - name: Stop kubelet
+          service:
+            name: kubelet
+            state: stopped
+
+        - name: Stop containerd
+          service:
+            name: containerd
+            state: stopped
+
+        - name: Backup containerd config
+          copy:
+            src: /etc/containerd/config.toml
+            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            remote_src: yes
+
+        - name: Add Docker repository GPG key
+          shell: |
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+            chmod a+r /etc/apt/keyrings/docker.asc
+          args:
+            creates: /etc/apt/keyrings/docker.asc
+
+        - name: Add Docker repository
+          shell: |
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+          args:
+            creates: /etc/apt/sources.list.d/docker.list
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+
+        - name: Upgrade containerd to 2.0+
+          apt:
+            name: containerd.io
+            state: latest
+            update_cache: yes
+
+        - name: Verify new containerd version
+          shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
+          register: new_containerd
+          changed_when: false
+
+        - name: Check upgrade success
+          assert:
+            that:
+              - (new_containerd.stdout.split('.')[0] | int) >= 2
+            fail_msg: "Не удалось обновить containerd до 2.0+. Текущая версия: {{ new_containerd.stdout }}"
+            success_msg: "containerd успешно обновлён до {{ new_containerd.stdout }}"
+
+        - name: Regenerate default containerd config
+          shell: |
+            mv /etc/containerd/config.toml /etc/containerd/config.toml.old-1.7
+            containerd config default > /etc/containerd/config.toml
+          args:
+            creates: /etc/containerd/config.toml.old-1.7
+
+        - name: Ensure SystemdCgroup = true
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'SystemdCgroup\s*=\s*false'
+            replace: 'SystemdCgroup = true'
+
+        - name: Set correct pause image
+          replace:
+            path: /etc/containerd/config.toml
+            regexp: 'sandbox_image\s*=\s*".*"'
+            replace: 'sandbox_image = "registry.k8s.io/pause:3.10"'
+
+        - name: Ensure CRI plugin is enabled
+          shell: "grep # ВАЖНО: Выполняется ДО апгрейда Kubernetes до 1.35!-E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
+          register: cri_check
+          changed_when: false
+          failed_when: cri_check.stdout == "BAD"
+
+        - name: Start containerd
+          service:
+            name: containerd
+            state: started
+            enabled: true
+
+        - name: Wait for containerd to be ready
+          shell: "ctr version || crictl version"
+          register: containerd_ready
+          retries: 10
+          delay: 3
+          until: containerd_ready.rc == 0
+          changed_when: false
+
+        - name: Start kubelet
+          service:
+            name: kubelet
+            state: started
+            enabled: true
+
+        - name: Wait for kubelet to be active
+          shell: systemctl is-active kubelet
+          register: kubelet_active
+          retries: 10
+          delay: 5
+          until: kubelet_active.stdout == "active"
+          changed_when: false
+
+        - name: Wait for node to be Ready
+          command: >
+            kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
+            --for=condition=Ready --timeout=10m
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: wait_ready
+          retries: 3
+          delay: 10
+          until: wait_ready.rc == 0
+
+        - name: Uncordon node
+          command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
+          delegate_to: "{{ groups['masters'][0] }}"
+
+        - debug:
+            msg: "✅ Worker нода {{ inventory_hostname }} обновлена: containerd {{ current_containerd.stdout }} → {{ new_containerd.stdout }}"
+
+        - name: Pause between worker nodes
+          pause:
+            seconds: 20
+            prompt: "Пауза 20 секунд перед следующей worker-нодой..."
+      when: needs_upgrade | bool
+
+    - name: Skip if already on 2.0+
+      debug:
+        msg: "⏭️  Worker нода {{ inventory_hostname }} уже на containerd {{ current_containerd.stdout }}, пропускаем"
+      when: not (needs_upgrade | bool)
+
+# ============================================================================
+# Финальная проверка
+# ============================================================================
+- name: Verify containerd upgrade
+  hosts: masters[0]
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Check all nodes are Ready
+      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      register: not_ready_final
+      changed_when: false
+      failed_when: not_ready_final.stdout != "0"
+
+    - name: Display final cluster state
+      command: kubectl get nodes -o wide
+      register: final_state
+      changed_when: false
+
+    - name: Get containerd versions from all nodes
+      shell: |
+        for node in $(kubectl get nodes -o name | cut -d/ -f2); do
+          version=$(kubectl get node $node -o jsonpath='{.status.nodeInfo.containerRuntimeVersion}')
+          echo "$node: $version"
+        done
+      register: containerd_versions
+      changed_when: false
+
+    - name: SUCCESS - containerd upgrade completed
+      debug:
+        msg:
+          - "=========================================="
+          - "✅ CONTAINERD ОБНОВЛЁН УСПЕШНО!"
+          - "=========================================="
+          - "Все ноды в состоянии Ready"
+          - ""
+          - "Версии containerd по нодам:"
+          - "{{ containerd_versions.stdout_lines }}"
+          - ""
+          - "Состояние кластера:"
+          - "{{ final_state.stdout }}"
+          - "=========================================="
+          - ""
+          - "🚀 Теперь можно обновлять Kubernetes до 1.35!"
+          - ""
+          - "Следующий шаг:"
+          - "ansible-playbook -i inventory.ini k8s-upgrade-fixed.yml"
+          - "=========================================="
