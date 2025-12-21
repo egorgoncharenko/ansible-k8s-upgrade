@@ -21,7 +21,7 @@ auto_detect_node_name: false
 # CRI настройки: containerd
 # ========================================
 cri_socket: "unix:///run/containerd/containerd.sock"
-configure_containerd: true
+configure_containerd: false
 pause_image: "registry.k8s.io/pause:3.10"
 
 # Проверки для K8s 1.35
