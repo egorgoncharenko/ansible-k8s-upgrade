@@ -62,6 +62,17 @@
     - debug:
         msg: "{{ nodes_state.stdout_lines }}"
 
+    - name: Check Kubernetes 1.35 specific requirements
+      debug:
+        msg:
+          - "⚠️  КРИТИЧНЫЕ ТРЕБОВАНИЯ ДЛЯ KUBERNETES 1.35:"
+          - "1. cgroup v2 ОБЯЗАТЕЛЕН (cgroup v1 удалён)"
+          - "2. containerd 2.0+ ОБЯЗАТЕЛЕН (1.x достиг EOL)"
+          - "3. IPVS mode deprecated (используйте iptables/nftables)"
+          - ""
+          - "Проверка будет выполнена на следующем шаге..."
+      when: (k8s_target.split('.')[1] | int) >= 35
+
     - name: Confirm upgrade readiness
       pause:
         prompt: |
@@ -158,6 +169,7 @@
         update_cache: yes
 
 # === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
+# === + Проверки для Kubernetes 1.35+ (cgroup v2, containerd 2.0+) ===
 - name: Ensure containerd is ready for Kubernetes
   hosts: "masters:workers"
   become: true
@@ -167,6 +179,61 @@
         name: containerd
         state: restarted
   tasks:
+    # Проверки для Kubernetes 1.35+
+    - name: Check cgroup version (CRITICAL for K8s 1.35+)
+      shell: "stat -fc %T /sys/fs/cgroup/"
+      register: cgroup_type
+      changed_when: false
+      when: (require_cgroup_v2 | default(false)) | bool
+
+    - name: Fail if cgroup v1 detected (K8s 1.35 requires v2)
+      fail:
+        msg: |
+          ❌ КРИТИЧЕСКАЯ ОШИБКА: Обнаружен cgroup v1
+          Kubernetes 1.35 ТРЕБУЕТ cgroup v2 (поддержка v1 УДАЛЕНА)
+          
+          Текущий тип: {{ cgroup_type.stdout }}
+          Требуется: cgroup2fs
+          
+          Решение:
+          1. Обновите ОС до версии с cgroup v2 по умолчанию
+          2. Или добавьте в grub: systemd.unified_cgroup_hierarchy=1
+          3. Перезагрузите ноду
+          
+          Подробнее: https://kubernetes.io/docs/concepts/architecture/cgroups/
+      when:
+        - (require_cgroup_v2 | default(false)) | bool
+        - cgroup_type.stdout != "cgroup2fs"
+
+    - name: Check containerd version
+      shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
+      register: containerd_version
+      changed_when: false
+      when: (require_containerd_2 | default(false)) | bool
+
+    - name: Parse containerd major version
+      set_fact:
+        containerd_major: "{{ containerd_version.stdout.split('.')[0] | int }}"
+      when: (require_containerd_2 | default(false)) | bool
+
+    - name: Fail if containerd < 2.0 (K8s 1.35 requires 2.0+)
+      fail:
+        msg: |
+          ❌ КРИТИЧЕСКАЯ ОШИБКА: Устаревшая версия containerd
+          Kubernetes 1.35 ТРЕБУЕТ containerd 2.0+ (1.x достиг EOL)
+          
+          Текущая версия: {{ containerd_version.stdout }}
+          Требуется: 2.0.0 или выше
+          
+          Решение:
+          1. Обновите containerd: apt-get install containerd.io
+          2. Или установите вручную с https://github.com/containerd/containerd/releases
+          
+          Подробнее: https://github.com/containerd/containerd/releases
+      when:
+        - (require_containerd_2 | default(false)) | bool
+        - (containerd_major | int) < 2
+
     - block:
         - name: Install containerd
           apt:
