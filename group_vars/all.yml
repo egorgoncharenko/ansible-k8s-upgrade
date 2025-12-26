@@ -8,11 +8,13 @@ k8s_target: "v1.35.0"
 # Минор для репозитория pkgs.k8s.io
 k8s_minor: "{{ k8s_target | regex_search('^v\\d+\\.\\d+') }}"
 
-# Кто выполняет kubectl drain/uncordon
-k8s_ctl_host: "{{ groups['masters'][0] }}"
+
+
+# Кто выполняет kubectl drain/uncordon (выбор любого доступного мастера, кроме текущего)
+k8s_ctl_host: "{{ groups['masters'] | reject('equalto', inventory_hostname) | first | default(groups['masters'][1]) }}"
 
 # Имена нод в кластере (если совпадают с inventory)
-k8s_node_name: "{{ inventory_hostname }}"
+#k8s_node_name: "{{ inventory_hostname }}"
 
 # Если имена в Kubernetes ≠ inventory, включай автодетект
 auto_detect_node_name: false
@@ -33,3 +35,4 @@ require_containerd_2: true
 # ========================================
 drain_timeout: "15m"
 wait_ready_timeout: "10m"
+kubeadm_api_timeout: "60s" 

@@ -104,7 +104,7 @@
       command: >-
         bash -lc "kubectl get node -o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{range .status.addresses[?(@.type==\"InternalIP\")]}{.address}{\"\\n\"}{end}{end}' |
         awk '$2==\"{{ ansible_host }}\" {print $1}'"
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: node_name_cmd
       changed_when: false
       failed_when: false
@@ -285,6 +285,8 @@
           failed_when: cact.stdout != "active"
       when: (configure_containerd | default(true)) | bool
 
+   
+        
 # ================= 4) Апгрейд CONTROL-PLANE (по одной ноде) =================
 - name: Upgrade control-plane nodes (serial=1)
   hosts: masters
@@ -293,7 +295,7 @@
   tasks:
     - name: Pre-upgrade node status check
       command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: pre_node_status
       changed_when: false
 
@@ -306,7 +308,7 @@
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
         --disable-eviction
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: drain_result
       retries: 3
       delay: 30
@@ -346,7 +348,15 @@
       command: kubeadm upgrade apply {{ k8s_target }} -y
       when: inventory_hostname == groups['masters'][0]
       register: kubeadm_upgrade_apply
+      failed_when: 
+        - kubeadm_upgrade_apply.rc != 0
+        - "'rolled back' not in kubeadm_upgrade_apply.stdout"
       changed_when: kubeadm_upgrade_apply.rc == 0
+      
+    - name: Set kubeadm API timeout
+      environment:
+         KUBEADM_API_TIMEOUT: "60s"
+      command: kubeadm upgrade node
 
     - name: kubeadm upgrade node (other masters)
       command: kubeadm upgrade node
@@ -387,7 +397,7 @@
       command: >
         kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
         --for=condition=Ready --timeout={{ wait_ready_timeout }}
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: wait_ready
       retries: 3
       delay: 10
@@ -395,11 +405,11 @@
 
     - name: Uncordon control-plane node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
 
     - name: Verify node version after upgrade
       shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: post_upgrade_version
       changed_when: false
 
@@ -419,7 +429,7 @@
   tasks:
     - name: Pre-upgrade node status check
       command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: pre_node_status
       changed_when: false
 
@@ -432,7 +442,7 @@
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
         --disable-eviction
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: drain_result
       retries: 3
       delay: 30
@@ -453,6 +463,10 @@
         state: present
         update_cache: yes
         allow_downgrades: yes
+      register: apt_result
+      until: apt_result is success
+      retries: 5
+      delay: 10
 
     - name: kubeadm upgrade node (workers)
       command: kubeadm upgrade node
@@ -467,7 +481,32 @@
         state: present
         update_cache: yes
         allow_downgrades: yes
+    
+    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
+      apt:
+        name:
+          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
+          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
+        state: present
+        update_cache: yes
+        allow_downgrades: yes
 
+    # --- НОВАЯ ЗАДАЧА ТУТ ---
+    - name: Remove deprecated pod-infra-container-image flag from kubeadm-flags
+      replace:
+        path: /var/lib/kubelet/kubeadm-flags.env
+        regexp: '--pod-infra-container-image=[^\s^"]+'
+        replace: ''
+      notify: restart kubelet # Если вы используете handlers, или оставьте как есть ниже
+
+    - name: systemd daemon-reexec
+      command: systemctl daemon-reexec
+
+    - name: Restart kubelet
+      service:
+        name: kubelet
+        state: restarted
+        enabled: true
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
 
@@ -492,19 +531,18 @@
       command: >
         kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
         --for=condition=Ready --timeout={{ wait_ready_timeout }}
-      delegate_to: "{{ groups['masters'][0] }}"
-      register: wait_ready
+      delegate_to: "{{ k8s_ctl_host }}"
       retries: 3
       delay: 10
       until: wait_ready.rc == 0
 
     - name: Uncordon worker node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ groups['masters'] | map('extract', hostvars) | selectattr('ansible_host', 'defined') | first }}"
 
     - name: Verify node version after upgrade
       shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
-      delegate_to: "{{ groups['masters'][0] }}"
+      delegate_to: "{{ k8s_ctl_host }}"
       register: post_upgrade_version
       changed_when: false
 

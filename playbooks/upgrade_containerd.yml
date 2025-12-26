@@ -313,7 +313,7 @@
             replace: 'sandbox_image = "registry.k8s.io/pause:3.10"'
 
         - name: Ensure CRI plugin is enabled
-          shell: "grep # ВАЖНО: Выполняется ДО апгрейда Kubernetes до 1.35!-E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
+          shell: "grep -E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
           register: cri_check
           changed_when: false
           failed_when: cri_check.stdout == "BAD"
