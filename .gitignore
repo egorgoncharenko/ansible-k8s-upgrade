@@ -3,4 +3,5 @@
 .vault_pass
 __pycache__/
 .env
+k8s
 
