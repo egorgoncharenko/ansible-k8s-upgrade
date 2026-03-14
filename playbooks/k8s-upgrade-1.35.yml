@@ -353,10 +353,7 @@
         - "'rolled back' not in kubeadm_upgrade_apply.stdout"
       changed_when: kubeadm_upgrade_apply.rc == 0
       
-    - name: Set kubeadm API timeout
-      environment:
-         KUBEADM_API_TIMEOUT: "60s"
-      command: kubeadm upgrade node
+   
 
     - name: kubeadm upgrade node (other masters)
       command: kubeadm upgrade node
@@ -482,14 +479,7 @@
         update_cache: yes
         allow_downgrades: yes
     
-    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
-      apt:
-        name:
-          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
-          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
-        state: present
-        update_cache: yes
-        allow_downgrades: yes
+    
 
     # --- НОВАЯ ЗАДАЧА ТУТ ---
     - name: Remove deprecated pod-infra-container-image flag from kubeadm-flags
