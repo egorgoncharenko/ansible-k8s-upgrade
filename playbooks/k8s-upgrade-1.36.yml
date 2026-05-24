@@ -45,7 +45,7 @@
           - "target_minor={{ target_minor }}"
           - "minor_diff={{ (target_minor | int) - (current_minor | int) }}"
 
-          
+
     - name: Validate upgrade path (max +1 minor version jump)
       assert:
         that:
@@ -335,12 +335,8 @@
     - name: Unhold kube packages
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
-    - name: Install kubeadm {{ k8s_target }} (pattern)
-      apt:
-        name: "kubeadm={{ k8s_target | regex_replace('^v','') }}-*"
-        state: present
-        update_cache: yes
-        allow_downgrades: yes
+    - name: Install kubeadm {{ k8s_target }} from local deb
+      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
 
     - name: Verify kubeadm version
       command: kubeadm version -o short
@@ -384,14 +380,8 @@
       register: kubeadm_upgrade_node
       changed_when: kubeadm_upgrade_node.rc == 0
 
-    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
-      apt:
-        name:
-          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
-          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
-        state: present
-        update_cache: yes
-        allow_downgrades: yes
+    - name: Install kubelet/kubectl {{ k8s_target }} from local deb
+      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
 
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
@@ -477,30 +467,16 @@
     - name: Unhold kube packages
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
-    - name: Install kubeadm {{ k8s_target }} (pattern)
-      apt:
-        name: "kubeadm={{ k8s_target | regex_replace('^v','') }}-*"
-        state: present
-        update_cache: yes
-        allow_downgrades: yes
-      register: apt_result
-      until: apt_result is success
-      retries: 5
-      delay: 10
+    - name: Install kubeadm {{ k8s_target }} from local deb
+      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
 
     - name: kubeadm upgrade node (workers)
       command: kubeadm upgrade node
       register: kubeadm_node_upgrade
       changed_when: kubeadm_node_upgrade.rc == 0
 
-    - name: Install kubelet/kubectl {{ k8s_target }} (pattern)
-      apt:
-        name:
-          - "kubelet={{ k8s_target | regex_replace('^v','') }}-*"
-          - "kubectl={{ k8s_target | regex_replace('^v','') }}-*"
-        state: present
-        update_cache: yes
-        allow_downgrades: yes
+    - name: Install kubelet/kubectl {{ k8s_target }} from local deb
+      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
     
     
 
