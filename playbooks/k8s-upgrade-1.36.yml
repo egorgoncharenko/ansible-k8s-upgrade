@@ -35,7 +35,17 @@
       set_fact:
         current_minor: "{{ current_k8s_version.stdout | trim | regex_replace('^v[0-9]+\\.([0-9]+)\\..*$', '\\1') | int }}"
         target_minor: "{{ k8s_target | trim | regex_replace('^v[0-9]+\\.([0-9]+)\\..*$', '\\1') | int }}"
+    
+    - name: Show parsed Kubernetes versions
+      debug:
+        msg:
+          - "current_k8s_version={{ current_k8s_version.stdout }}"
+          - "k8s_target={{ k8s_target }}"
+          - "current_minor={{ current_minor }}"
+          - "target_minor={{ target_minor }}"
+          - "minor_diff={{ (target_minor | int) - (current_minor | int) }}"
 
+          
     - name: Validate upgrade path (max +1 minor version jump)
       assert:
         that:
