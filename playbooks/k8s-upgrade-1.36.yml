@@ -62,13 +62,13 @@
     - debug:
         msg: "{{ nodes_state.stdout_lines }}"
 
-    - name: Check Kubernetes 1.35 specific requirements
+    - name: Check Kubernetes 1.36 specific requirements
       debug:
         msg:
-          - "⚠️  КРИТИЧНЫЕ ТРЕБОВАНИЯ ДЛЯ KUBERNETES 1.35:"
-          - "1. cgroup v2 ОБЯЗАТЕЛЕН (cgroup v1 удалён)"
-          - "2. containerd 2.0+ ОБЯЗАТЕЛЕН (1.x достиг EOL)"
-          - "3. IPVS mode deprecated (используйте iptables/nftables)"
+          - "⚠️  КРИТИЧНЫЕ ТРЕБОВАНИЯ ДЛЯ KUBERNETES {{ k8s_target }}:"
+          - "1. cgroup v2 должен быть включён"
+          - "2. containerd 2.0+ требуется согласно require_containerd_2=true"
+          - "3. IPVS mode deprecated — лучше использовать iptables/nftables"
           - ""
           - "Проверка будет выполнена на следующем шаге..."
       when: (k8s_target.split('.')[1] | int) >= 35
@@ -186,11 +186,11 @@
       changed_when: false
       when: (require_cgroup_v2 | default(false)) | bool
 
-    - name: Fail if cgroup v1 detected (K8s 1.35 requires v2)
+    - name: Fail if cgroup v1 detected when cgroup v2 is required
       fail:
         msg: |
           ❌ КРИТИЧЕСКАЯ ОШИБКА: Обнаружен cgroup v1
-          Kubernetes 1.35 ТРЕБУЕТ cgroup v2 (поддержка v1 УДАЛЕНА)
+          Kubernetes {{ k8s_target }} требует cgroup v2 согласно require_cgroup_v2=true
           
           Текущий тип: {{ cgroup_type.stdout }}
           Требуется: cgroup2fs
@@ -216,11 +216,11 @@
         containerd_major: "{{ containerd_version.stdout.split('.')[0] | int }}"
       when: (require_containerd_2 | default(false)) | bool
 
-    - name: Fail if containerd < 2.0 (K8s 1.35 requires 2.0+)
+    - name: Fail if containerd < 2.0 when required
       fail:
         msg: |
           ❌ КРИТИЧЕСКАЯ ОШИБКА: Устаревшая версия containerd
-          Kubernetes 1.35 ТРЕБУЕТ containerd 2.0+ (1.x достиг EOL)
+          Kubernetes {{ k8s_target }} требует containerd 2.0+ согласно require_containerd_2=true
           
           Текущая версия: {{ containerd_version.stdout }}
           Требуется: 2.0.0 или выше
@@ -343,6 +343,17 @@
       when: inventory_hostname == groups['masters'][0]
       register: images_pull
       changed_when: images_pull.rc == 0
+
+    - name: kubeadm upgrade plan (first master only)
+      command: kubeadm upgrade plan
+      when: inventory_hostname == groups['masters'][0]
+      register: kubeadm_upgrade_plan
+      changed_when: false
+
+    - name: Show kubeadm upgrade plan
+      debug:
+        msg: "{{ kubeadm_upgrade_plan.stdout_lines }}"
+      when: inventory_hostname == groups['masters'][0]
 
     - name: kubeadm upgrade apply (first master with -y flag)
       command: kubeadm upgrade apply {{ k8s_target }} -y
@@ -481,22 +492,12 @@
     
     
 
-    # --- НОВАЯ ЗАДАЧА ТУТ ---
     - name: Remove deprecated pod-infra-container-image flag from kubeadm-flags
       replace:
         path: /var/lib/kubelet/kubeadm-flags.env
         regexp: '--pod-infra-container-image=[^\s^"]+'
         replace: ''
-      notify: restart kubelet # Если вы используете handlers, или оставьте как есть ниже
 
-    - name: systemd daemon-reexec
-      command: systemctl daemon-reexec
-
-    - name: Restart kubelet
-      service:
-        name: kubelet
-        state: restarted
-        enabled: true
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
 
@@ -522,13 +523,14 @@
         kubectl wait node/{{ hostvars[inventory_hostname].k8s_node_name }}
         --for=condition=Ready --timeout={{ wait_ready_timeout }}
       delegate_to: "{{ k8s_ctl_host }}"
+      register: wait_ready
       retries: 3
       delay: 10
       until: wait_ready.rc == 0
 
     - name: Uncordon worker node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
-      delegate_to: "{{ groups['masters'] | map('extract', hostvars) | selectattr('ansible_host', 'defined') | first }}"
+      delegate_to: "{{ k8s_ctl_host }}"
 
     - name: Verify node version after upgrade
       shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
