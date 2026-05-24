@@ -24,10 +24,12 @@
         var: kubectl_ver.stdout
 
     - name: Get current cluster version
-      shell: kubectl version -o json | jq -r '.serverVersion.gitVersion'
+      shell: |
+        kubectl get --raw /version | jq -r '.gitVersion'
       register: current_k8s_version
       changed_when: false
-      failed_when: current_k8s_version.rc != 0
+      failed_when:
+        - current_k8s_version.rc != 0 or current_k8s_version.stdout | trim == "" or current_k8s_version.stdout | trim == "null"
 
     - name: Parse version numbers for validation
       set_fact:
