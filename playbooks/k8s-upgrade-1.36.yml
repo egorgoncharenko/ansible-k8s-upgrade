@@ -31,8 +31,8 @@
 
     - name: Parse version numbers for validation
       set_fact:
-        current_minor: "{{ current_k8s_version.stdout.split('.')[1] | int }}"
-        target_minor: "{{ k8s_target.split('.')[1] | int }}"
+        current_minor: "{{ ((current_k8s_version.stdout | trim | regex_replace('^v', '')).split('.'))[1] | int }}"
+        target_minor: "{{ ((k8s_target | trim | regex_replace('^v', '')).split('.'))[1] | int }}"
 
     - name: Validate upgrade path (max +1 minor version jump)
       assert:
