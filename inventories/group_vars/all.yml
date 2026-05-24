@@ -6,6 +6,7 @@
 k8s_target: "v1.36.1"
 
 # Минор для репозитория pkgs.k8s.io
+
 k8s_minor: "v1.36"
 
 
