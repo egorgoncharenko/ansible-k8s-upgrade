@@ -5,6 +5,9 @@
 # Целевая версия кластера (патч-точно)
 k8s_target: "v1.36.1"
 
+# Debian-версия пакетов в pkgs.k8s.io (без начального "v")
+k8s_package_version: "1.36.1-1.1"
+
 # Минор для репозитория pkgs.k8s.io
 
 k8s_minor: "v1.36"
@@ -13,6 +16,9 @@ k8s_minor: "v1.36"
 
 # Кто выполняет kubectl drain/uncordon (выбор любого доступного мастера, кроме текущего)
 k8s_ctl_host: "{{ (groups['masters'] | reject('equalto', inventory_hostname) | list | first) | default(groups['masters'][0]) }}"
+
+# Административный kubeconfig kubeadm control-plane
+k8s_admin_kubeconfig: "/etc/kubernetes/admin.conf"
 
 # Имена нод в кластере (если совпадают с inventory)
 #k8s_node_name: "{{ inventory_hostname }}"
@@ -36,4 +42,10 @@ require_containerd_2: true
 # ========================================
 drain_timeout: "15m"
 wait_ready_timeout: "10m"
-kubeadm_api_timeout: "60s" 
+kubeadm_api_timeout: "60s"
+
+# По умолчанию drain соблюдает PodDisruptionBudget. Включать только осознанно.
+drain_disable_eviction: false
+
+# Необязательная точная версия containerd.io. Пустая строка = доступная версия.
+containerd_package_version: ""

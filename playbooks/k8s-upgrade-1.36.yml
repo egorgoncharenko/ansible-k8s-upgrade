@@ -4,42 +4,86 @@
   hosts: masters[0]
   gather_facts: false
   become: false
+  environment:
+    KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
   tasks:
+    - name: Check kubeadm admin kubeconfig
+      stat:
+        path: "{{ k8s_admin_kubeconfig }}"
+      register: admin_kubeconfig
+      check_mode: false
+
+    - name: Require kubeadm admin kubeconfig
+      assert:
+        that:
+          - admin_kubeconfig.stat.exists
+          - admin_kubeconfig.stat.isreg
+          - admin_kubeconfig.stat.readable | default(false)
+        fail_msg: >-
+          Административный kubeconfig не найден или недоступен:
+          {{ k8s_admin_kubeconfig }}
+
     - name: Validate k8s_target format (vX.Y.Z)
       assert:
         that:
           - k8s_target is match('^v\\d+\\.\\d+\\.\\d+$')
+          - k8s_package_version is match('^\\d+\\.\\d+\\.\\d+-[^ ]+$')
+          - k8s_package_version.split('-')[0] == k8s_target | regex_replace('^v', '')
         fail_msg: "k8s_target должен быть вида vX.Y.Z, сейчас: {{ k8s_target }}"
 
     - name: Check kubectl present and usable
-      shell: >
-        kubectl version --client -o=yaml 2>/dev/null
-        || kubectl version --client=true 2>/dev/null
-        || kubectl version 2>/dev/null
+      command:
+        argv:
+          - kubectl
+          - version
+          - --client=true
+          - -o=yaml
       register: kubectl_ver
+      check_mode: false
       changed_when: false
       failed_when: kubectl_ver.rc != 0
 
     - debug:
         var: kubectl_ver.stdout
 
-    - name: Get current cluster version
-      shell: |
-        kubectl get --raw /version | jq -r '.gitVersion'
-      register: current_k8s_version
+    - name: Get current cluster version document
+      command:
+        argv:
+          - kubectl
+          - get
+          - --raw=/version
+      register: current_k8s_version_response
+      check_mode: false
       changed_when: false
       failed_when:
-        - current_k8s_version.rc != 0 or current_k8s_version.stdout | trim == "" or current_k8s_version.stdout | trim == "null"
+        - current_k8s_version_response.rc != 0 or (current_k8s_version_response.stdout | trim) == ""
+
+    - name: Parse current cluster version
+      set_fact:
+        current_k8s_version: "{{ (current_k8s_version_response.stdout | from_json).gitVersion }}"
+
+    - name: Validate current cluster version returned by API
+      assert:
+        that:
+          - current_k8s_version is defined
+          - current_k8s_version is match('^v\\d+\\.\\d+\\.\\d+.*$')
+        fail_msg: >-
+          Kubernetes API вернул некорректную версию:
+          {{ current_k8s_version_response.stdout }}
 
     - name: Parse version numbers for validation
       set_fact:
-        current_minor: "{{ current_k8s_version.stdout | trim | regex_replace('^v[0-9]+\\.([0-9]+)\\..*$', '\\1') | int }}"
+        current_major: "{{ current_k8s_version | regex_replace('^v([0-9]+)\\..*$', '\\1') | int }}"
+        current_minor: "{{ current_k8s_version | regex_replace('^v[0-9]+\\.([0-9]+)\\..*$', '\\1') | int }}"
+        current_patch: "{{ current_k8s_version | regex_replace('^v[0-9]+\\.[0-9]+\\.([0-9]+).*$', '\\1') | int }}"
+        target_major: "{{ k8s_target | trim | regex_replace('^v([0-9]+)\\..*$', '\\1') | int }}"
         target_minor: "{{ k8s_target | trim | regex_replace('^v[0-9]+\\.([0-9]+)\\..*$', '\\1') | int }}"
+        target_patch: "{{ k8s_target | trim | regex_replace('^v[0-9]+\\.[0-9]+\\.([0-9]+)$', '\\1') | int }}"
     
     - name: Show parsed Kubernetes versions
       debug:
         msg:
-          - "current_k8s_version={{ current_k8s_version.stdout }}"
+          - "current_k8s_version={{ current_k8s_version }}"
           - "k8s_target={{ k8s_target }}"
           - "current_minor={{ current_minor }}"
           - "target_minor={{ target_minor }}"
@@ -49,26 +93,72 @@
     - name: Validate upgrade path (max +1 minor version jump)
       assert:
         that:
+          - (target_major | int) == (current_major | int)
           - (target_minor | int) - (current_minor | int) <= 1
           - (target_minor | int) - (current_minor | int) >= 0
+          - (target_minor | int) > (current_minor | int) or (target_patch | int) >= (current_patch | int)
         fail_msg: |
-          ОШИБКА: Нельзя перепрыгивать минорные версии!
-          Текущая версия: {{ current_k8s_version.stdout }}
+          ОШИБКА: недопустимый путь обновления Kubernetes.
+          Текущая версия: {{ current_k8s_version }}
           Целевая версия: {{ k8s_target }}
-          Разница минорных версий: {{ (target_minor | int) - (current_minor | int) }}
-          
-          Kubernetes можно апгрейдить только на +1 минорную версию за раз.
-          Например: 1.30.x → 1.31.x (OK), но 1.29.x → 1.31.x (ОШИБКА)
+          Major-версия не должна меняться, можно перейти не более чем на
+          один minor за раз, а patch downgrade внутри одного minor запрещён.
 
     - name: Check all nodes are Ready before upgrade
-      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' |
+        awk '$2 != "True" { count++ } END { print count + 0 }'
       register: not_ready_nodes
+      check_mode: false
       changed_when: false
-      failed_when: not_ready_nodes.stdout != "0"
+      failed_when: (not_ready_nodes.stdout | int) != 0
+
+    - name: Capture pre-upgrade workload health
+      command:
+        argv:
+          - kubectl
+          - get
+          - pods
+          - --all-namespaces
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
+      register: workload_before_raw
+      check_mode: false
+      changed_when: false
+      failed_when: false
+
+    - name: Build pre-upgrade workload issue baseline
+      set_fact:
+        workload_issues_before: >-
+          {{
+            workload_before_raw.stdout_lines
+            | select('search', '\\|(Pending|Failed|Unknown)\\||ContainerCreating|CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|CreateContainerError|RunContainerError|InvalidImageName|\\|Running\\|.*false:')
+            | list
+          }}
+      when: workload_before_raw.rc == 0
+
+    - name: Build pre-upgrade affected pod list
+      set_fact:
+        workload_pods_before: >-
+          {{
+            workload_issues_before
+            | map('regex_replace', '^([^|]+).*$', '\\1')
+            | unique
+            | list
+          }}
+      when: workload_before_raw.rc == 0
+
+    - name: Warn when pre-upgrade workload snapshot is unavailable
+      debug:
+        msg: >-
+          Не удалось получить pre-upgrade workload snapshot.
+          Workload report будет показан без сравнения: {{ workload_before_raw.stderr | default('') }}
+      when: workload_before_raw.rc != 0
 
     - name: Display current cluster state
       shell: kubectl get nodes -o wide
       register: nodes_state
+      check_mode: false
       changed_when: false
 
     - debug:
@@ -91,7 +181,7 @@
           
           ========================================
           Готов к апгрейду кластера!
-          Текущая версия: {{ current_k8s_version.stdout }}
+          Текущая версия: {{ current_k8s_version }}
           Целевая версия: {{ k8s_target }}
           ========================================
           
@@ -111,6 +201,8 @@
   hosts: "masters:workers"
   gather_facts: false
   become: false
+  environment:
+    KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
   tasks:
     - name: Find k8s node name by ansible_host IP
       command: >-
@@ -118,6 +210,7 @@
         awk '$2==\"{{ ansible_host }}\" {print $1}'"
       delegate_to: "{{ k8s_ctl_host }}"
       register: node_name_cmd
+      check_mode: false
       changed_when: false
       failed_when: false
       when: (auto_detect_node_name | default(false)) | bool
@@ -136,6 +229,14 @@
           - k8s_node_name | length > 0
         fail_msg: "k8s_node_name не установлен для {{ inventory_hostname }}"
 
+    - name: Verify selected control-plane delegate can reach the API
+      command: kubectl get --raw=/readyz
+      delegate_to: "{{ k8s_ctl_host }}"
+      register: delegated_api_ready
+      check_mode: false
+      changed_when: false
+      failed_when: delegated_api_ready.rc != 0 or (delegated_api_ready.stdout | trim) != "ok"
+
 # ======= 2) Настроить APT-репозиторий Kubernetes (minor-pinned) на всех нодах =======
 - name: Configure Kubernetes apt repo on all nodes
   hosts: "masters:workers"
@@ -153,7 +254,6 @@
           - ca-certificates
           - curl
           - gpg
-          - jq
         state: present
         update_cache: yes
 
@@ -180,6 +280,20 @@
       apt:
         update_cache: yes
 
+    - name: Check target Kubernetes packages are available
+      shell: >-
+        apt-cache madison {{ item }} |
+        awk '{print $3}' |
+        grep -Fx -- '{{ k8s_package_version }}'
+      loop:
+        - kubeadm
+        - kubelet
+        - kubectl
+      register: available_k8s_packages
+      check_mode: false
+      changed_when: false
+      failed_when: available_k8s_packages.rc != 0
+
 # === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
 # === + Проверки для Kubernetes 1.35+ (cgroup v2, containerd 2.0+) ===
 - name: Ensure containerd is ready for Kubernetes
@@ -195,6 +309,7 @@
     - name: Check cgroup version (CRITICAL for K8s 1.35+)
       shell: "stat -fc %T /sys/fs/cgroup/"
       register: cgroup_type
+      check_mode: false
       changed_when: false
       when: (require_cgroup_v2 | default(false)) | bool
 
@@ -220,6 +335,7 @@
     - name: Check containerd version
       shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
       register: containerd_version
+      check_mode: false
       changed_when: false
       when: (require_containerd_2 | default(false)) | bool
 
@@ -275,6 +391,7 @@
         - name: Fail if CRI plugin disabled
           shell: "grep -E 'disabled_plugins\\s*=.*\"cri\"' -q /etc/containerd/config.toml && echo BAD || echo OK"
           register: cri_disabled
+          check_mode: false
           changed_when: false
 
         - name: Abort when CRI plugin disabled in containerd
@@ -293,6 +410,7 @@
         - name: Ensure containerd is active
           shell: "systemctl is-active containerd"
           register: cact
+          check_mode: false
           changed_when: false
           failed_when: cact.stdout != "active"
       when: (configure_containerd | default(true)) | bool
@@ -315,11 +433,11 @@
         msg: "Апгрейд ноды: {{ hostvars[inventory_hostname].k8s_node_name }}"
 
     - name: Drain control-plane node
-      command: >
+      shell: >
         kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
-        --disable-eviction
+        {{ '--disable-eviction' if drain_disable_eviction | bool else '' }}
       delegate_to: "{{ k8s_ctl_host }}"
       register: drain_result
       retries: 3
@@ -332,16 +450,32 @@
         msg: "Не удалось выполнить drain ноды {{ hostvars[inventory_hostname].k8s_node_name }} после 3 попыток"
       when: drain_result.rc != 0
 
-    - name: Unhold kube packages
-      shell: "apt-mark unhold kubeadm kubelet kubectl || true"
+    - name: Install and hold kubeadm
+      block:
+        - name: Unhold kubeadm
+          command: apt-mark unhold kubeadm
+          changed_when: false
 
-    - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+        - name: Install kubeadm {{ k8s_package_version }}
+          apt:
+            name: "kubeadm={{ k8s_package_version }}"
+            state: present
+            update_cache: yes
 
-    - name: Verify kubeadm version
-      command: kubeadm version -o short
-      register: kubeadm_version_check
-      changed_when: false
+        - name: Verify kubeadm version
+          command: kubeadm version -o short
+          register: kubeadm_version_check
+          changed_when: false
+
+        - name: Assert kubeadm is on target version
+          assert:
+            that:
+              - (kubeadm_version_check.stdout | trim) == k8s_target
+            fail_msg: "Ожидался kubeadm {{ k8s_target }}, установлен {{ kubeadm_version_check.stdout | trim }}"
+      always:
+        - name: Restore kubeadm package hold
+          command: apt-mark hold kubeadm
+          changed_when: false
 
     - debug:
         msg: "Установлена версия kubeadm: {{ kubeadm_version_check.stdout }}"
@@ -367,9 +501,7 @@
       command: kubeadm upgrade apply {{ k8s_target }} -y
       when: inventory_hostname == groups['masters'][0]
       register: kubeadm_upgrade_apply
-      failed_when: 
-        - kubeadm_upgrade_apply.rc != 0
-        - "'rolled back' not in kubeadm_upgrade_apply.stdout"
+      failed_when: kubeadm_upgrade_apply.rc != 0
       changed_when: kubeadm_upgrade_apply.rc == 0
       
    
@@ -380,11 +512,34 @@
       register: kubeadm_upgrade_node
       changed_when: kubeadm_upgrade_node.rc == 0
 
-    - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+    - name: Install and hold kubelet and kubectl
+      block:
+        - name: Unhold kubelet and kubectl
+          command: apt-mark unhold kubelet kubectl
+          changed_when: false
 
-    - name: Hold kube packages
-      shell: "apt-mark hold kubeadm kubelet kubectl"
+        - name: Install kubelet and kubectl {{ k8s_package_version }}
+          apt:
+            name:
+              - "kubelet={{ k8s_package_version }}"
+              - "kubectl={{ k8s_package_version }}"
+            state: present
+      always:
+        - name: Restore kubelet and kubectl package holds
+          command: apt-mark hold kubelet kubectl
+          changed_when: false
+
+    - name: Check kubeadm flags file
+      stat:
+        path: /var/lib/kubelet/kubeadm-flags.env
+      register: kubeadm_flags
+
+    - name: Remove deprecated pod-infra-container-image flag
+      replace:
+        path: /var/lib/kubelet/kubeadm-flags.env
+        regexp: '(?:^|\s)--pod-infra-container-image=[^\s"]+'
+        replace: ''
+      when: kubeadm_flags.stat.exists
 
     - name: systemd daemon-reexec
       command: systemctl daemon-reexec
@@ -417,6 +572,20 @@
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
       delegate_to: "{{ k8s_ctl_host }}"
 
+    - name: Verify control-plane node is schedulable
+      command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.spec.unschedulable}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      register: node_unschedulable
+      changed_when: false
+      failed_when: node_unschedulable.rc != 0 or (node_unschedulable.stdout | trim) == "true"
+
     - name: Verify node version after upgrade
       shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
       delegate_to: "{{ k8s_ctl_host }}"
@@ -447,11 +616,11 @@
         msg: "Апгрейд worker-ноды: {{ hostvars[inventory_hostname].k8s_node_name }}"
 
     - name: Drain worker node
-      command: >
+      shell: >
         kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
         --ignore-daemonsets --delete-emptydir-data
         --grace-period=60 --timeout={{ drain_timeout }}
-        --disable-eviction
+        {{ '--disable-eviction' if drain_disable_eviction | bool else '' }}
       delegate_to: "{{ k8s_ctl_host }}"
       register: drain_result
       retries: 3
@@ -464,30 +633,68 @@
         msg: "Не удалось выполнить drain ноды {{ hostvars[inventory_hostname].k8s_node_name }} после 3 попыток"
       when: drain_result.rc != 0
 
-    - name: Unhold kube packages
-      shell: "apt-mark unhold kubeadm kubelet kubectl || true"
+    - name: Install and hold kubeadm
+      block:
+        - name: Unhold kubeadm
+          command: apt-mark unhold kubeadm
+          changed_when: false
 
-    - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+        - name: Install kubeadm {{ k8s_package_version }}
+          apt:
+            name: "kubeadm={{ k8s_package_version }}"
+            state: present
+            update_cache: yes
+
+        - name: Verify kubeadm version
+          command: kubeadm version -o short
+          register: kubeadm_version_check
+          changed_when: false
+
+        - name: Assert kubeadm is on target version
+          assert:
+            that:
+              - (kubeadm_version_check.stdout | trim) == k8s_target
+            fail_msg: "Ожидался kubeadm {{ k8s_target }}, установлен {{ kubeadm_version_check.stdout | trim }}"
+      always:
+        - name: Restore kubeadm package hold
+          command: apt-mark hold kubeadm
+          changed_when: false
 
     - name: kubeadm upgrade node (workers)
       command: kubeadm upgrade node
       register: kubeadm_node_upgrade
       changed_when: kubeadm_node_upgrade.rc == 0
 
-    - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+    - name: Install and hold kubelet and kubectl
+      block:
+        - name: Unhold kubelet and kubectl
+          command: apt-mark unhold kubelet kubectl
+          changed_when: false
+
+        - name: Install kubelet and kubectl {{ k8s_package_version }}
+          apt:
+            name:
+              - "kubelet={{ k8s_package_version }}"
+              - "kubectl={{ k8s_package_version }}"
+            state: present
+      always:
+        - name: Restore kubelet and kubectl package holds
+          command: apt-mark hold kubelet kubectl
+          changed_when: false
     
     
+
+    - name: Check kubeadm flags file
+      stat:
+        path: /var/lib/kubelet/kubeadm-flags.env
+      register: kubeadm_flags
 
     - name: Remove deprecated pod-infra-container-image flag from kubeadm-flags
       replace:
         path: /var/lib/kubelet/kubeadm-flags.env
-        regexp: '--pod-infra-container-image=[^\s^"]+'
+        regexp: '(?:^|\s)--pod-infra-container-image=[^\s"]+'
         replace: ''
-
-    - name: Hold kube packages
-      shell: "apt-mark hold kubeadm kubelet kubectl"
+      when: kubeadm_flags.stat.exists
 
     - name: systemd daemon-reexec
       command: systemctl daemon-reexec
@@ -520,6 +727,20 @@
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
       delegate_to: "{{ k8s_ctl_host }}"
 
+    - name: Verify worker node is schedulable
+      command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.spec.unschedulable}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      register: node_unschedulable
+      changed_when: false
+      failed_when: node_unschedulable.rc != 0 or (node_unschedulable.stdout | trim) == "true"
+
     - name: Verify node version after upgrade
       shell: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'
       delegate_to: "{{ k8s_ctl_host }}"
@@ -546,10 +767,12 @@
         prompt: "Даём кластеру 30 секунд на стабилизацию..."
 
     - name: Check all nodes are Ready
-      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' |
+        awk '$2 != "True" { count++ } END { print count + 0 }'
       register: not_ready_final
       changed_when: false
-      failed_when: not_ready_final.stdout != "0"
+      failed_when: (not_ready_final.stdout | int) != 0
 
     - name: Get all node versions
       shell: kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
@@ -560,25 +783,108 @@
         msg: "{{ all_versions.stdout_lines }}"
 
     - name: Verify all nodes on target version
-      shell: kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}' | tr ' ' '\n' | grep -v "{{ k8s_target }}" | wc -l
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.kubeletVersion}{"\n"}{end}' |
+        awk -v target="{{ k8s_target }}" '$0 != target { count++ } END { print count + 0 }'
       register: wrong_version_count
       changed_when: false
-      failed_when: wrong_version_count.stdout != "0"
+      failed_when: (wrong_version_count.stdout | int) != 0
 
-    - name: Check cluster component status
-      command: kubectl get componentstatuses
-      register: component_status
+    - name: Check API server readiness
+      command: kubectl get --raw=/readyz
+      register: api_ready
+      changed_when: false
+      failed_when: api_ready.rc != 0 or (api_ready.stdout | trim) != "ok"
+
+    - name: Capture post-upgrade workload health
+      command:
+        argv:
+          - kubectl
+          - get
+          - pods
+          - --all-namespaces
+          - -o
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
+      register: workload_after_raw
       changed_when: false
       failed_when: false
 
-    - debug:
-        msg: "{{ component_status.stdout_lines }}"
-      when: component_status.rc == 0
+    - name: Build post-upgrade workload issue list
+      set_fact:
+        workload_issues_after: >-
+          {{
+            workload_after_raw.stdout_lines
+            | select('search', '\\|(Pending|Failed|Unknown)\\||ContainerCreating|CrashLoopBackOff|ImagePullBackOff|ErrImagePull|CreateContainerConfigError|CreateContainerError|RunContainerError|InvalidImageName|\\|Running\\|.*false:')
+            | list
+          }}
+      when: workload_after_raw.rc == 0
 
-    - name: Get pods status across all namespaces
-      shell: kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded | tail -n +2 | wc -l
-      register: problematic_pods
-      changed_when: false
+    - name: Build post-upgrade affected pod list
+      set_fact:
+        workload_pods_after: >-
+          {{
+            workload_issues_after
+            | map('regex_replace', '^([^|]+).*$', '\\1')
+            | unique
+            | list
+          }}
+      when: workload_after_raw.rc == 0
+
+    - name: Compare workload health before and after upgrade
+      set_fact:
+        workload_new_problem_pods: "{{ workload_pods_after | default([]) | difference(workload_pods_before | default([])) | sort }}"
+        workload_existing_problem_pods: "{{ workload_pods_after | default([]) | intersect(workload_pods_before | default([])) | sort }}"
+        workload_resolved_problem_pods: "{{ workload_pods_before | default([]) | difference(workload_pods_after | default([])) | sort }}"
+      when:
+        - workload_before_raw.rc == 0
+        - workload_after_raw.rc == 0
+
+    - name: Post-upgrade workload health report
+      debug:
+        msg:
+          - "=========================================="
+          - "POST-UPGRADE WORKLOAD HEALTH REPORT"
+          - "=========================================="
+          - "Аномалий до upgrade: {{ workload_pods_before | default([]) | length }}"
+          - "Аномалий после upgrade: {{ workload_pods_after | default([]) | length }}"
+          - "Новые: {{ workload_new_problem_pods | default([]) }}"
+          - "Существовали до upgrade: {{ workload_existing_problem_pods | default([]) }}"
+          - "Разрешились: {{ workload_resolved_problem_pods | default([]) }}"
+          - "Текущие детали: {{ workload_issues_after | default([]) }}"
+      when:
+        - workload_before_raw.rc == 0
+        - workload_after_raw.rc == 0
+
+    - name: Post-upgrade workload health report without baseline
+      debug:
+        msg:
+          - "=========================================="
+          - "POST-UPGRADE WORKLOAD HEALTH REPORT"
+          - "=========================================="
+          - "Pre-upgrade snapshot недоступен; сравнение не выполнено."
+          - "Текущие anomalies: {{ workload_pods_after | default([]) }}"
+          - "Текущие детали: {{ workload_issues_after | default([]) }}"
+      when:
+        - workload_before_raw.rc != 0
+        - workload_after_raw.rc == 0
+
+    - name: Warn about newly appeared workload anomalies
+      debug:
+        msg:
+          - "⚠️ После upgrade появились новые workload anomalies."
+          - "{{ workload_new_problem_pods }}"
+          - "Они не меняют статус Kubernetes upgrade, но требуют проверки."
+      when:
+        - workload_before_raw.rc == 0
+        - workload_after_raw.rc == 0
+        - workload_new_problem_pods | default([]) | length > 0
+
+    - name: Warn when post-upgrade workload snapshot is unavailable
+      debug:
+        msg: >-
+          Не удалось получить post-upgrade workload snapshot.
+          Это не меняет статус Kubernetes upgrade: {{ workload_after_raw.stderr | default('') }}
+      when: workload_after_raw.rc != 0
 
     - name: Display final cluster state
       command: kubectl get nodes -o wide
@@ -593,15 +899,8 @@
           - "=========================================="
           - "Целевая версия: {{ k8s_target }}"
           - "Все ноды обновлены и в состоянии Ready"
-          - "Проблемных подов: {{ problematic_pods.stdout }}"
+          - "Workload anomalies не влияют на статус upgrade; см. post-upgrade report выше."
           - ""
           - "Финальное состояние кластера:"
           - "{{ final_state.stdout }}"
           - "=========================================="
-
-    - name: Warning about problematic pods
-      debug:
-        msg:
-          - "⚠️  ВНИМАНИЕ: Обнаружены поды не в Running/Succeeded статусе!"
-          - "Проверьте: kubectl get pods -A | grep -v Running | grep -v Completed"
-      when: problematic_pods.stdout != "0"
