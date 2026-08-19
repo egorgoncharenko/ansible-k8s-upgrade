@@ -3,10 +3,20 @@
 # ========================================
 
 # Целевая версия кластера (патч-точно)
-k8s_target: "v1.36.1"
+k8s_target: "v1.36.3"
 
 # Debian-версия пакетов в pkgs.k8s.io (без начального "v")
-k8s_package_version: "1.36.1-1.1"
+k8s_package_version: "1.36.3-1.1"
+
+# Источник Kubernetes-пакетов: local или repo.
+# Local остаётся безопасным offline-режимом по умолчанию.
+k8s_package_source: "local"
+k8s_local_deb_dir: "/tmp"
+k8s_package_arch: "amd64"
+k8s_local_deb_packages:
+  kubeadm: "{{ k8s_local_deb_dir }}/kubeadm_{{ k8s_package_version }}_{{ k8s_package_arch }}.deb"
+  kubelet: "{{ k8s_local_deb_dir }}/kubelet_{{ k8s_package_version }}_{{ k8s_package_arch }}.deb"
+  kubectl: "{{ k8s_local_deb_dir }}/kubectl_{{ k8s_package_version }}_{{ k8s_package_arch }}.deb"
 
 # Минор для репозитория pkgs.k8s.io
 

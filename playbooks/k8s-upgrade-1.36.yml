@@ -27,6 +27,7 @@
       assert:
         that:
           - k8s_target is match('^v\\d+\\.\\d+\\.\\d+$')
+          - k8s_package_source in ['local', 'repo']
           - k8s_package_version is match('^\\d+\\.\\d+\\.\\d+-[^ ]+$')
           - k8s_package_version.split('-')[0] == k8s_target | regex_replace('^v', '')
         fail_msg: "k8s_target должен быть вида vX.Y.Z, сейчас: {{ k8s_target }}"
@@ -121,7 +122,7 @@
           - pods
           - --all-namespaces
           - -o
-          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{"init:"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
       register: workload_before_raw
       check_mode: false
       changed_when: false
@@ -142,7 +143,7 @@
         workload_pods_before: >-
           {{
             workload_issues_before
-            | map('regex_replace', '^([^|]+).*$', '\\1')
+            | map('regex_replace', '\\|.*$', '')
             | unique
             | list
           }}
@@ -238,7 +239,7 @@
       failed_when: delegated_api_ready.rc != 0 or (delegated_api_ready.stdout | trim) != "ok"
 
 # ======= 2) Настроить APT-репозиторий Kubernetes (minor-pinned) на всех нодах =======
-- name: Configure Kubernetes apt repo on all nodes
+- name: Prepare Kubernetes packages on all nodes
   hosts: "masters:workers"
   become: true
   pre_tasks:
@@ -246,7 +247,54 @@
       set_fact:
         k8s_minor: "{{ k8s_target | regex_search('^v\\d+\\.\\d+') }}"
       when: k8s_minor is not defined
+
+    - name: Determine required Kubernetes packages for this node role
+      set_fact:
+        k8s_required_packages: >-
+          {{ ['kubeadm', 'kubelet'] + (['kubectl'] if 'masters' in group_names else []) }}
   tasks:
+    - name: Check local Kubernetes package files
+      stat:
+        path: "{{ k8s_local_deb_packages[item] }}"
+      loop: "{{ k8s_required_packages }}"
+      register: local_deb_files
+      check_mode: false
+      when: k8s_package_source == 'local'
+
+    - name: Require every local Kubernetes package
+      assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg | default(false)
+          - (item.stat.size | default(0) | int) > 0
+        fail_msg: "Локальный пакет {{ item.item }} отсутствует или пуст: {{ k8s_local_deb_packages[item.item] }}"
+      loop: "{{ local_deb_files.results }}"
+      when: k8s_package_source == 'local'
+
+    - name: Read local Kubernetes package metadata
+      command:
+        argv:
+          - dpkg-deb
+          - --field
+          - "{{ k8s_local_deb_packages[item] }}"
+      loop: "{{ k8s_required_packages }}"
+      register: local_deb_metadata
+      check_mode: false
+      changed_when: false
+      when: k8s_package_source == 'local'
+
+    - name: Verify local Kubernetes package metadata
+      assert:
+        that:
+          - "item.stdout is search('(?m)^Package: ' ~ item.item ~ '$')"
+          - "item.stdout is search('(?m)^Version: ' ~ (k8s_package_version | regex_escape) ~ '$')"
+          - "item.stdout is search('(?m)^Architecture: ' ~ (k8s_package_arch | regex_escape) ~ '$')"
+        fail_msg: >-
+          Метаданные {{ k8s_local_deb_packages[item.item] }} не совпадают с
+          package={{ item.item }}, version={{ k8s_package_version }}, architecture={{ k8s_package_arch }}.
+      loop: "{{ local_deb_metadata.results }}"
+      when: k8s_package_source == 'local'
+
     - name: Install apt prerequisites
       apt:
         name:
@@ -256,12 +304,14 @@
           - gpg
         state: present
         update_cache: yes
+      when: k8s_package_source == 'repo'
 
     - name: Ensure keyrings dir exists
       file:
         path: /etc/apt/keyrings
         state: directory
         mode: '0755'
+      when: k8s_package_source == 'repo'
 
     - name: Add Kubernetes apt key
       shell: |
@@ -269,30 +319,31 @@
         | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      when: k8s_package_source == 'repo'
 
     - name: Configure Kubernetes apt source (minor-pinned)
       copy:
         dest: /etc/apt/sources.list.d/kubernetes.list
         mode: '0644'
         content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/{{ k8s_minor }}/deb/ /"
+      when: k8s_package_source == 'repo'
 
     - name: apt update
       apt:
         update_cache: yes
+      when: k8s_package_source == 'repo'
 
     - name: Check target Kubernetes packages are available
       shell: >-
         apt-cache madison {{ item }} |
         awk '{print $3}' |
         grep -Fx -- '{{ k8s_package_version }}'
-      loop:
-        - kubeadm
-        - kubelet
-        - kubectl
+      loop: "{{ k8s_required_packages }}"
       register: available_k8s_packages
       check_mode: false
       changed_when: false
       failed_when: available_k8s_packages.rc != 0
+      when: k8s_package_source == 'repo'
 
 # === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
 # === + Проверки для Kubernetes 1.35+ (cgroup v2, containerd 2.0+) ===
@@ -456,15 +507,25 @@
           command: apt-mark unhold kubeadm
           changed_when: false
 
-        - name: Install kubeadm {{ k8s_package_version }}
+        - name: Install kubeadm from local deb
+          command:
+            argv:
+              - dpkg
+              - --install
+              - "{{ k8s_local_deb_packages.kubeadm }}"
+          when: k8s_package_source == 'local'
+
+        - name: Install kubeadm {{ k8s_package_version }} from repository
           apt:
             name: "kubeadm={{ k8s_package_version }}"
             state: present
             update_cache: yes
+          when: k8s_package_source == 'repo'
 
         - name: Verify kubeadm version
           command: kubeadm version -o short
           register: kubeadm_version_check
+          check_mode: false
           changed_when: false
 
         - name: Assert kubeadm is on target version
@@ -472,6 +533,7 @@
             that:
               - (kubeadm_version_check.stdout | trim) == k8s_target
             fail_msg: "Ожидался kubeadm {{ k8s_target }}, установлен {{ kubeadm_version_check.stdout | trim }}"
+          when: not ansible_check_mode
       always:
         - name: Restore kubeadm package hold
           command: apt-mark hold kubeadm
@@ -518,16 +580,55 @@
           command: apt-mark unhold kubelet kubectl
           changed_when: false
 
-        - name: Install kubelet and kubectl {{ k8s_package_version }}
+        - name: Install kubelet and kubectl from local debs
+          command:
+            argv:
+              - dpkg
+              - --install
+              - "{{ k8s_local_deb_packages.kubelet }}"
+              - "{{ k8s_local_deb_packages.kubectl }}"
+          when: k8s_package_source == 'local'
+
+        - name: Install kubelet and kubectl {{ k8s_package_version }} from repository
           apt:
             name:
               - "kubelet={{ k8s_package_version }}"
               - "kubectl={{ k8s_package_version }}"
             state: present
+          when: k8s_package_source == 'repo'
       always:
         - name: Restore kubelet and kubectl package holds
           command: apt-mark hold kubelet kubectl
           changed_when: false
+
+    - name: Read installed kubelet and kubectl package versions
+      command:
+        argv:
+          - dpkg-query
+          - --show
+          - '--showformat=${Version}'
+          - "{{ item }}"
+      loop:
+        - kubelet
+        - kubectl
+      register: installed_k8s_package_versions
+      check_mode: false
+      changed_when: false
+
+    - name: Assert kubelet and kubectl packages are on target version
+      assert:
+        that:
+          - (item.stdout | trim) == k8s_package_version
+        fail_msg: >-
+          Ожидался {{ item.item }}={{ k8s_package_version }},
+          установлено {{ item.stdout | trim }}
+      loop: "{{ installed_k8s_package_versions.results }}"
+      when: not ansible_check_mode
+
+    - name: Display installed kubelet and kubectl package versions
+      debug:
+        msg: "{{ item.item }}={{ item.stdout | trim }}"
+      loop: "{{ installed_k8s_package_versions.results }}"
 
     - name: Check kubeadm flags file
       stat:
@@ -550,12 +651,29 @@
         state: restarted
         enabled: true
 
-    - name: Wait for kubelet to be active
-      shell: systemctl is-active kubelet
-      register: kubelet_active
+    - name: Report current kubelet state in check mode
+      service_facts:
+      check_mode: false
+      changed_when: false
+      when: ansible_check_mode
+
+    - name: Display current kubelet state in check mode
+      debug:
+        msg: >-
+          kubelet.service current state is
+          {{ ansible_facts.services['kubelet.service'].state | default('not-found') }};
+          restart and post-restart wait are not performed in check mode.
+      when: ansible_check_mode
+
+    - name: Wait for kubelet to be active after restart
+      service_facts:
+      register: kubelet_service_facts
       retries: 10
       delay: 5
-      until: kubelet_active.stdout == "active"
+      until: >-
+        (ansible_facts.services['kubelet.service'].state | default('unknown')) == 'running'
+      when: not ansible_check_mode
+      check_mode: false
       changed_when: false
 
     - name: Wait node Ready
@@ -567,6 +685,7 @@
       retries: 3
       delay: 10
       until: wait_ready.rc == 0
+      when: not ansible_check_mode
 
     - name: Uncordon control-plane node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
@@ -639,15 +758,25 @@
           command: apt-mark unhold kubeadm
           changed_when: false
 
-        - name: Install kubeadm {{ k8s_package_version }}
+        - name: Install kubeadm from local deb
+          command:
+            argv:
+              - dpkg
+              - --install
+              - "{{ k8s_local_deb_packages.kubeadm }}"
+          when: k8s_package_source == 'local'
+
+        - name: Install kubeadm {{ k8s_package_version }} from repository
           apt:
             name: "kubeadm={{ k8s_package_version }}"
             state: present
             update_cache: yes
+          when: k8s_package_source == 'repo'
 
         - name: Verify kubeadm version
           command: kubeadm version -o short
           register: kubeadm_version_check
+          check_mode: false
           changed_when: false
 
         - name: Assert kubeadm is on target version
@@ -655,6 +784,7 @@
             that:
               - (kubeadm_version_check.stdout | trim) == k8s_target
             fail_msg: "Ожидался kubeadm {{ k8s_target }}, установлен {{ kubeadm_version_check.stdout | trim }}"
+          when: not ansible_check_mode
       always:
         - name: Restore kubeadm package hold
           command: apt-mark hold kubeadm
@@ -665,22 +795,53 @@
       register: kubeadm_node_upgrade
       changed_when: kubeadm_node_upgrade.rc == 0
 
-    - name: Install and hold kubelet and kubectl
+    - name: Install and hold kubelet on worker
       block:
-        - name: Unhold kubelet and kubectl
-          command: apt-mark unhold kubelet kubectl
+        - name: Unhold kubelet
+          command: apt-mark unhold kubelet
           changed_when: false
 
-        - name: Install kubelet and kubectl {{ k8s_package_version }}
+        - name: Install kubelet from local deb
+          command:
+            argv:
+              - dpkg
+              - --install
+              - "{{ k8s_local_deb_packages.kubelet }}"
+          when: k8s_package_source == 'local'
+
+        - name: Install kubelet {{ k8s_package_version }} from repository
           apt:
-            name:
-              - "kubelet={{ k8s_package_version }}"
-              - "kubectl={{ k8s_package_version }}"
+            name: "kubelet={{ k8s_package_version }}"
             state: present
+          when: k8s_package_source == 'repo'
       always:
-        - name: Restore kubelet and kubectl package holds
-          command: apt-mark hold kubelet kubectl
+        - name: Restore kubelet package hold
+          command: apt-mark hold kubelet
           changed_when: false
+
+    - name: Read installed kubelet package version
+      command:
+        argv:
+          - dpkg-query
+          - --show
+          - '--showformat=${Version}'
+          - kubelet
+      register: installed_kubelet_package_version
+      check_mode: false
+      changed_when: false
+
+    - name: Assert kubelet package is on target version
+      assert:
+        that:
+          - (installed_kubelet_package_version.stdout | trim) == k8s_package_version
+        fail_msg: >-
+          Ожидался kubelet={{ k8s_package_version }},
+          установлено {{ installed_kubelet_package_version.stdout | trim }}
+      when: not ansible_check_mode
+
+    - name: Display installed kubelet package version
+      debug:
+        msg: "kubelet={{ installed_kubelet_package_version.stdout | trim }}"
     
     
 
@@ -705,12 +866,29 @@
         state: restarted
         enabled: true
 
-    - name: Wait for kubelet to be active
-      shell: systemctl is-active kubelet
-      register: kubelet_active
+    - name: Report current kubelet state in check mode
+      service_facts:
+      check_mode: false
+      changed_when: false
+      when: ansible_check_mode
+
+    - name: Display current kubelet state in check mode
+      debug:
+        msg: >-
+          kubelet.service current state is
+          {{ ansible_facts.services['kubelet.service'].state | default('not-found') }};
+          restart and post-restart wait are not performed in check mode.
+      when: ansible_check_mode
+
+    - name: Wait for kubelet to be active after restart
+      service_facts:
+      register: kubelet_service_facts
       retries: 10
       delay: 5
-      until: kubelet_active.stdout == "active"
+      until: >-
+        (ansible_facts.services['kubelet.service'].state | default('unknown')) == 'running'
+      when: not ansible_check_mode
+      check_mode: false
       changed_when: false
 
     - name: Wait node Ready
@@ -722,6 +900,7 @@
       retries: 3
       delay: 10
       until: wait_ready.rc == 0
+      when: not ansible_check_mode
 
     - name: Uncordon worker node
       command: "kubectl uncordon {{ hostvars[inventory_hostname].k8s_node_name }}"
@@ -804,7 +983,7 @@
           - pods
           - --all-namespaces
           - -o
-          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
+          - 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.status.phase}{"|"}{range .status.initContainerStatuses[*]}{"init:"}{.state.waiting.reason}{" "}{end}{range .status.containerStatuses[*]}{.ready}{":"}{.state.waiting.reason}{" "}{end}{"\n"}{end}'
       register: workload_after_raw
       changed_when: false
       failed_when: false
@@ -824,7 +1003,7 @@
         workload_pods_after: >-
           {{
             workload_issues_after
-            | map('regex_replace', '^([^|]+).*$', '\\1')
+            | map('regex_replace', '\\|.*$', '')
             | unique
             | list
           }}
