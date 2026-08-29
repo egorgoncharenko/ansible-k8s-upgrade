@@ -474,6 +474,165 @@
   serial: 1
   become: true
   tasks:
+    - name: Get current kubelet version reported by control-plane node
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.status.nodeInfo.kubeletVersion}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      register: current_node_kubelet_version
+      check_mode: false
+      changed_when: false
+
+    - name: Read current control-plane static pod manifest
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/manifests/kube-apiserver.yaml
+      register: current_control_plane_manifest
+      check_mode: false
+
+    - name: Decode kube-apiserver manifest
+      ansible.builtin.set_fact:
+        kube_apiserver_manifest_decoded: >-
+          {{ current_control_plane_manifest.content | b64decode }}
+
+    - name: Determine kube-apiserver image
+      ansible.builtin.set_fact:
+        kube_apiserver_image: >-
+          {{
+            (kube_apiserver_manifest_decoded | from_yaml).spec.containers
+            | selectattr('name', 'equalto', 'kube-apiserver')
+            | map(attribute='image')
+            | first
+            | default('')
+          }}
+
+    - name: Debug kube-apiserver image
+      ansible.builtin.debug:
+        msg:
+          - "kube_apiserver_image={{ kube_apiserver_image }}"
+          - "kube_apiserver_image_type={{ kube_apiserver_image | type_debug }}"
+
+    - name: Determine current control-plane version
+      ansible.builtin.set_fact:
+        current_node_control_plane_version: >-
+          {{
+            kube_apiserver_image
+            | regex_replace('^.*:', '')
+            | regex_replace('@.*$', '')
+            | trim
+          }}
+
+    - name: Determine whether control-plane node is already at target version
+      ansible.builtin.set_fact:
+        node_already_at_target: >-
+          {{
+            (current_node_kubelet_version.stdout | trim) == k8s_target
+            and
+            current_node_control_plane_version == k8s_target
+          }}
+
+    - name: Validate detected control-plane versions
+      ansible.builtin.assert:
+        that:
+          - (current_node_kubelet_version.stdout | trim) is match('^v\\d+\\.\\d+\\.\\d+.*$')
+          - current_node_control_plane_version is match('^v\\d+\\.\\d+\\.\\d+$')
+        fail_msg: >-
+          Не удалось надёжно определить версии control-plane ноды
+          {{ hostvars[inventory_hostname].k8s_node_name }}: kubelet={{ current_node_kubelet_version.stdout | trim }},
+          kube-apiserver={{ current_node_control_plane_version | default('unknown') }}.
+
+    - name: Report control-plane node already at target version
+      ansible.builtin.debug:
+        msg: >-
+          Control-plane нода {{ hostvars[inventory_hostname].k8s_node_name }} уже на {{ k8s_target }};
+          drain, kubeadm upgrade, package installation and kubelet restart are skipped.
+      when: node_already_at_target | bool
+
+    - name: Check scheduling state of control-plane node already at target version
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.spec.unschedulable}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      register: target_node_unschedulable
+      check_mode: false
+      changed_when: false
+      when: node_already_at_target | bool
+
+    - name: Uncordon control-plane node already at target version
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - uncordon
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      when:
+        - node_already_at_target | bool
+        - (target_node_unschedulable.stdout | trim) == 'true'
+        - not ansible_check_mode
+
+    - name: Verify target control-plane node is schedulable before skip
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.spec.unschedulable}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      register: target_node_schedulable_check
+      check_mode: false
+      changed_when: false
+      failed_when: >-
+        target_node_schedulable_check.rc != 0 or
+        (target_node_schedulable_check.stdout | trim) == 'true'
+      when:
+        - node_already_at_target | bool
+        - not ansible_check_mode
+
+    - name: Verify target control-plane node is Ready before skip
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.status.conditions[?(@.type=="Ready")].status}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      register: target_node_ready
+      check_mode: false
+      changed_when: false
+      failed_when: >-
+        target_node_ready.rc != 0 or
+        (target_node_ready.stdout | trim) != 'True'
+      when: node_already_at_target | bool
+
+    - name: Skip real upgrade for control-plane node already at target version
+      ansible.builtin.meta: end_host
+      when:
+        - node_already_at_target | bool
+        - not ansible_check_mode
+
     - name: Pre-upgrade node status check
       command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
       delegate_to: "{{ k8s_ctl_host }}"
@@ -544,24 +703,32 @@
 
     - name: kubeadm config images pull (first master only)
       command: kubeadm config images pull --kubernetes-version {{ k8s_target }}
-      when: inventory_hostname == groups['masters'][0]
+      when:
+        - inventory_hostname == groups['masters'][0]
+        - current_node_control_plane_version != k8s_target
       register: images_pull
       changed_when: images_pull.rc == 0
 
     - name: kubeadm upgrade plan (first master only)
       command: kubeadm upgrade plan
-      when: inventory_hostname == groups['masters'][0]
+      when:
+        - inventory_hostname == groups['masters'][0]
+        - current_node_control_plane_version != k8s_target
       register: kubeadm_upgrade_plan
       changed_when: false
 
     - name: Show kubeadm upgrade plan
       debug:
         msg: "{{ kubeadm_upgrade_plan.stdout_lines }}"
-      when: inventory_hostname == groups['masters'][0]
+      when:
+        - inventory_hostname == groups['masters'][0]
+        - current_node_control_plane_version != k8s_target
 
     - name: kubeadm upgrade apply (first master with -y flag)
       command: kubeadm upgrade apply {{ k8s_target }} -y
-      when: inventory_hostname == groups['masters'][0]
+      when:
+        - inventory_hostname == groups['masters'][0]
+        - current_node_control_plane_version != k8s_target
       register: kubeadm_upgrade_apply
       failed_when: kubeadm_upgrade_apply.rc != 0
       changed_when: kubeadm_upgrade_apply.rc == 0
@@ -570,7 +737,9 @@
 
     - name: kubeadm upgrade node (other masters)
       command: kubeadm upgrade node
-      when: inventory_hostname != groups['masters'][0]
+      when:
+        - inventory_hostname != groups['masters'][0]
+        - current_node_control_plane_version != k8s_target
       register: kubeadm_upgrade_node
       changed_when: kubeadm_upgrade_node.rc == 0
 
@@ -666,15 +835,21 @@
       when: ansible_check_mode
 
     - name: Wait for kubelet to be active after restart
-      service_facts:
-      register: kubelet_service_facts
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - kubelet
+      register: kubelet_active
+      changed_when: false
+      failed_when: false
       retries: 10
       delay: 5
-      until: >-
-        (ansible_facts.services['kubelet.service'].state | default('unknown')) == 'running'
+      until:
+        - kubelet_active.rc == 0
+        - kubelet_active.stdout | trim == 'active'
       when: not ansible_check_mode
       check_mode: false
-      changed_when: false
 
     - name: Wait node Ready
       command: >
@@ -725,6 +900,49 @@
   serial: 1
   become: true
   tasks:
+    - name: Get current kubelet version reported by worker node
+      ansible.builtin.command:
+        argv:
+          - kubectl
+          - get
+          - node
+          - "{{ hostvars[inventory_hostname].k8s_node_name }}"
+          - -o
+          - 'jsonpath={.status.nodeInfo.kubeletVersion}'
+      delegate_to: "{{ k8s_ctl_host }}"
+      environment:
+        KUBECONFIG: "{{ k8s_admin_kubeconfig }}"
+      register: current_node_kubelet_version
+      check_mode: false
+      changed_when: false
+
+    - name: Determine whether worker node is already at target version
+      ansible.builtin.set_fact:
+        node_already_at_target: >-
+          {{ (current_node_kubelet_version.stdout | trim) == k8s_target }}
+
+    - name: Validate detected worker kubelet version
+      ansible.builtin.assert:
+        that:
+          - (current_node_kubelet_version.stdout | trim) is match('^v\\d+\\.\\d+\\.\\d+.*$')
+        fail_msg: >-
+          Не удалось надёжно определить kubeletVersion worker-ноды
+          {{ hostvars[inventory_hostname].k8s_node_name }}:
+          {{ current_node_kubelet_version.stdout | trim }}.
+
+    - name: Report worker node already at target version
+      ansible.builtin.debug:
+        msg: >-
+          Worker-нода {{ hostvars[inventory_hostname].k8s_node_name }} уже на {{ k8s_target }};
+          drain, kubeadm upgrade, package installation and kubelet restart are skipped.
+      when: node_already_at_target | bool
+
+    - name: Skip real upgrade for worker node already at target version
+      ansible.builtin.meta: end_host
+      when:
+        - node_already_at_target | bool
+        - not ansible_check_mode
+
     - name: Pre-upgrade node status check
       command: kubectl get node {{ hostvars[inventory_hostname].k8s_node_name }} -o wide
       delegate_to: "{{ k8s_ctl_host }}"
@@ -881,15 +1099,21 @@
       when: ansible_check_mode
 
     - name: Wait for kubelet to be active after restart
-      service_facts:
-      register: kubelet_service_facts
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - kubelet
+      register: kubelet_active
+      changed_when: false
+      failed_when: false
       retries: 10
       delay: 5
-      until: >-
-        (ansible_facts.services['kubelet.service'].state | default('unknown')) == 'running'
+      until:
+        - kubelet_active.rc == 0
+        - kubelet_active.stdout | trim == 'active'
       when: not ansible_check_mode
       check_mode: false
-      changed_when: false
 
     - name: Wait node Ready
       command: >
