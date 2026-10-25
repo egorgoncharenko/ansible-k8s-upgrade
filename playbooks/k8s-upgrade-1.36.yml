@@ -367,9 +367,11 @@
       command: kubeadm upgrade apply {{ k8s_target }} -y
       when: inventory_hostname == groups['masters'][0]
       register: kubeadm_upgrade_apply
-      failed_when: 
-        - kubeadm_upgrade_apply.rc != 0
-        - "'rolled back' not in kubeadm_upgrade_apply.stdout"
+    - name: kubeadm upgrade apply (first master with -y flag)
+      command: kubeadm upgrade apply {{ k8s_target }} -y
+      when: inventory_hostname == groups['masters'][0]
+      register: kubeadm_upgrade_apply
+      failed_when: kubeadm_upgrade_apply.rc != 0
       changed_when: kubeadm_upgrade_apply.rc == 0
       
    
