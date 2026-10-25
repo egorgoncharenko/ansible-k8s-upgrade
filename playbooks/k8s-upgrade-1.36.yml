@@ -1,6 +1,7 @@
 ---
 # ===================== 0) PRECHECKS: базовые проверки с первого мастера =====================
 - name: Prechecks (kubectl доступ)
+  any_errors_fatal: true
   hosts: masters[0]
   gather_facts: false
   become: false
@@ -108,6 +109,7 @@
 
 # ============ 1) (ОПЦИОНАЛЬНО) автодетект k8s_node_name по InternalIP ============
 - name: Autodetect k8s_node_name by InternalIP (если нужно)
+  any_errors_fatal: true
   hosts: "masters:workers"
   gather_facts: false
   become: false
@@ -138,6 +140,7 @@
 
 # ======= 2) Настроить APT-репозиторий Kubernetes (minor-pinned) на всех нодах =======
 - name: Configure Kubernetes apt repo on all nodes
+  any_errors_fatal: true
   hosts: "masters:workers"
   become: true
   pre_tasks:
@@ -183,6 +186,7 @@
 # === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
 # === + Проверки для Kubernetes 1.35+ (cgroup v2, containerd 2.0+) ===
 - name: Ensure containerd is ready for Kubernetes
+  any_errors_fatal: true
   hosts: "masters:workers"
   become: true
   handlers:
@@ -301,6 +305,7 @@
         
 # ================= 4) Апгрейд CONTROL-PLANE (по одной ноде) =================
 - name: Upgrade control-plane nodes (serial=1)
+  any_errors_fatal: true
   hosts: masters
   serial: 1
   become: true
@@ -435,6 +440,7 @@
 
 # =================== 5) Апгрейд WORKER-нод (по одной) ===================
 - name: Upgrade worker nodes (serial=1)
+  any_errors_fatal: true
   hosts: workers
   serial: 1
   become: true
@@ -538,6 +544,7 @@
 
 # =================== 6) ФИНАЛЬНЫЕ ПРОВЕРКИ ===================
 - name: Final cluster health verification
+  any_errors_fatal: true
   hosts: masters[0]
   gather_facts: false
   become: false
