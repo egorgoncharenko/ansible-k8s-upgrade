@@ -9,10 +9,12 @@
   become: false
   tasks:
     - name: Check cluster is healthy
-      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' |
+        awk '$2 != "True" { count++ } END { print count + 0 }'
       register: not_ready_nodes
       changed_when: false
-      failed_when: not_ready_nodes.stdout != "0"
+      failed_when: (not_ready_nodes.stdout | int) != 0
 
     - name: Display cluster state
       shell: kubectl get nodes -o wide
@@ -61,36 +63,11 @@
       set_fact:
         needs_upgrade: "{{ current_containerd.stdout.split('.')[0] | int < 2 }}"
 
+    - name: Initialize drain state
+      set_fact:
+        node_drained: false
+
     - block:
-        - name: Drain node
-          command: >
-            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
-            --ignore-daemonsets --delete-emptydir-data
-            --grace-period=60 --timeout=15m
-            --disable-eviction
-          delegate_to: "{{ groups['masters'][0] }}"
-          register: drain_result
-          retries: 3
-          delay: 30
-          until: drain_result.rc == 0
-
-        - name: Stop kubelet
-          service:
-            name: kubelet
-            state: stopped
-
-        - name: Stop containerd
-          service:
-            name: containerd
-            state: stopped
-
-        - name: Backup containerd config
-          copy:
-            src: /etc/containerd/config.toml
-            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
-            remote_src: yes
-          when: ansible_facts.file_exists | default(false)
-
         - name: Add Docker repository GPG key
           shell: |
             install -m 0755 -d /etc/apt/keyrings
@@ -105,15 +82,61 @@
           args:
             creates: /etc/apt/sources.list.d/docker.list
 
-        - name: Update apt cache
+        - name: Update apt cache before draining the node
           apt:
             update_cache: yes
 
+        - name: Verify requested containerd package is available
+          shell: |
+            if test -n '{{ containerd_package_version }}'; then
+              apt-cache madison containerd.io | awk '{print $3}' | grep -Fx -- '{{ containerd_package_version }}'
+            else
+              apt-cache policy containerd.io | awk '/Candidate:/ { if ($2 != "(none)") found=1 } END { exit !found }'
+            fi
+          changed_when: false
+
+        - name: Drain node
+          command: >
+            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+            --ignore-daemonsets --delete-emptydir-data
+            --grace-period=60 --timeout=15m
+            {{ '--disable-eviction' if drain_disable_eviction | bool else '' }}
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: drain_result
+          retries: 3
+          delay: 30
+          until: drain_result.rc == 0
+
+        - name: Record successful drain
+          set_fact:
+            node_drained: true
+
+        - name: Stop kubelet
+          service:
+            name: kubelet
+            state: stopped
+
+        - name: Stop containerd
+          service:
+            name: containerd
+            state: stopped
+
+        - name: Check containerd config
+          stat:
+            path: /etc/containerd/config.toml
+          register: containerd_config
+
+        - name: Backup containerd config
+          copy:
+            src: /etc/containerd/config.toml
+            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            remote_src: yes
+          when: containerd_config.stat.exists
+
         - name: Upgrade containerd to 2.0+
           apt:
-            name: containerd.io
-            state: latest
-            update_cache: yes
+            name: "{{ 'containerd.io=' ~ containerd_package_version if containerd_package_version | length > 0 else 'containerd.io' }}"
+            state: "{{ 'present' if containerd_package_version | length > 0 else 'latest' }}"
 
         - name: Verify new containerd version
           shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
@@ -129,10 +152,10 @@
 
         - name: Regenerate default containerd config
           shell: |
-            mv /etc/containerd/config.toml /etc/containerd/config.toml.old-1.7
+            if test -f /etc/containerd/config.toml; then
+              mv /etc/containerd/config.toml /etc/containerd/config.toml.old-{{ ansible_date_time.epoch }}
+            fi
             containerd config default > /etc/containerd/config.toml
-          args:
-            creates: /etc/containerd/config.toml.old-1.7
 
         - name: Ensure SystemdCgroup = true
           replace:
@@ -201,6 +224,41 @@
           pause:
             seconds: 30
             prompt: "Пауза 30 секунд перед следующей control-plane нодой..."
+      rescue:
+        - name: Check whether a containerd backup was created
+          stat:
+            path: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+          register: containerd_backup
+          when: node_drained | bool
+
+        - name: Restore containerd configuration after a failed upgrade
+          copy:
+            src: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            dest: /etc/containerd/config.toml
+            remote_src: yes
+          when:
+            - node_drained | bool
+            - containerd_backup.stat.exists | default(false)
+
+        - name: Try to start containerd after a failed upgrade
+          service:
+            name: containerd
+            state: started
+          failed_when: false
+          when: node_drained | bool
+
+        - name: Try to start kubelet after a failed upgrade
+          service:
+            name: kubelet
+            state: started
+          failed_when: false
+          when: node_drained | bool
+
+        - name: Abort and keep the failed node cordoned
+          fail:
+            msg: >-
+              Обновление containerd на {{ inventory_hostname }} не завершено.
+              {{ 'Конфигурация по возможности восстановлена, службы запущены, нода оставлена cordoned.' if node_drained | bool else 'Ошибка возникла до drain; состояние ноды не менялось.' }}
       when: needs_upgrade | bool
 
     - name: Skip if already on 2.0+
@@ -228,35 +286,11 @@
       set_fact:
         needs_upgrade: "{{ current_containerd.stdout.split('.')[0] | int < 2 }}"
 
+    - name: Initialize drain state
+      set_fact:
+        node_drained: false
+
     - block:
-        - name: Drain node
-          command: >
-            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
-            --ignore-daemonsets --delete-emptydir-data
-            --grace-period=60 --timeout=15m
-            --disable-eviction
-          delegate_to: "{{ groups['masters'][0] }}"
-          register: drain_result
-          retries: 3
-          delay: 30
-          until: drain_result.rc == 0
-
-        - name: Stop kubelet
-          service:
-            name: kubelet
-            state: stopped
-
-        - name: Stop containerd
-          service:
-            name: containerd
-            state: stopped
-
-        - name: Backup containerd config
-          copy:
-            src: /etc/containerd/config.toml
-            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
-            remote_src: yes
-
         - name: Add Docker repository GPG key
           shell: |
             install -m 0755 -d /etc/apt/keyrings
@@ -271,15 +305,61 @@
           args:
             creates: /etc/apt/sources.list.d/docker.list
 
-        - name: Update apt cache
+        - name: Update apt cache before draining the node
           apt:
             update_cache: yes
 
+        - name: Verify requested containerd package is available
+          shell: |
+            if test -n '{{ containerd_package_version }}'; then
+              apt-cache madison containerd.io | awk '{print $3}' | grep -Fx -- '{{ containerd_package_version }}'
+            else
+              apt-cache policy containerd.io | awk '/Candidate:/ { if ($2 != "(none)") found=1 } END { exit !found }'
+            fi
+          changed_when: false
+
+        - name: Drain node
+          command: >
+            kubectl drain {{ hostvars[inventory_hostname].k8s_node_name }}
+            --ignore-daemonsets --delete-emptydir-data
+            --grace-period=60 --timeout=15m
+            {{ '--disable-eviction' if drain_disable_eviction | bool else '' }}
+          delegate_to: "{{ groups['masters'][0] }}"
+          register: drain_result
+          retries: 3
+          delay: 30
+          until: drain_result.rc == 0
+
+        - name: Record successful drain
+          set_fact:
+            node_drained: true
+
+        - name: Stop kubelet
+          service:
+            name: kubelet
+            state: stopped
+
+        - name: Stop containerd
+          service:
+            name: containerd
+            state: stopped
+
+        - name: Check containerd config
+          stat:
+            path: /etc/containerd/config.toml
+          register: containerd_config
+
+        - name: Backup containerd config
+          copy:
+            src: /etc/containerd/config.toml
+            dest: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            remote_src: yes
+          when: containerd_config.stat.exists
+
         - name: Upgrade containerd to 2.0+
           apt:
-            name: containerd.io
-            state: latest
-            update_cache: yes
+            name: "{{ 'containerd.io=' ~ containerd_package_version if containerd_package_version | length > 0 else 'containerd.io' }}"
+            state: "{{ 'present' if containerd_package_version | length > 0 else 'latest' }}"
 
         - name: Verify new containerd version
           shell: "containerd --version | awk '{print $3}' | cut -d'v' -f2"
@@ -295,10 +375,10 @@
 
         - name: Regenerate default containerd config
           shell: |
-            mv /etc/containerd/config.toml /etc/containerd/config.toml.old-1.7
+            if test -f /etc/containerd/config.toml; then
+              mv /etc/containerd/config.toml /etc/containerd/config.toml.old-{{ ansible_date_time.epoch }}
+            fi
             containerd config default > /etc/containerd/config.toml
-          args:
-            creates: /etc/containerd/config.toml.old-1.7
 
         - name: Ensure SystemdCgroup = true
           replace:
@@ -367,6 +447,41 @@
           pause:
             seconds: 20
             prompt: "Пауза 20 секунд перед следующей worker-нодой..."
+      rescue:
+        - name: Check whether a containerd backup was created
+          stat:
+            path: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+          register: containerd_backup
+          when: node_drained | bool
+
+        - name: Restore containerd configuration after a failed upgrade
+          copy:
+            src: /etc/containerd/config.toml.backup-{{ ansible_date_time.epoch }}
+            dest: /etc/containerd/config.toml
+            remote_src: yes
+          when:
+            - node_drained | bool
+            - containerd_backup.stat.exists | default(false)
+
+        - name: Try to start containerd after a failed upgrade
+          service:
+            name: containerd
+            state: started
+          failed_when: false
+          when: node_drained | bool
+
+        - name: Try to start kubelet after a failed upgrade
+          service:
+            name: kubelet
+            state: started
+          failed_when: false
+          when: node_drained | bool
+
+        - name: Abort and keep the failed node cordoned
+          fail:
+            msg: >-
+              Обновление containerd на {{ inventory_hostname }} не завершено.
+              {{ 'Конфигурация по возможности восстановлена, службы запущены, нода оставлена cordoned.' if node_drained | bool else 'Ошибка возникла до drain; состояние ноды не менялось.' }}
       when: needs_upgrade | bool
 
     - name: Skip if already on 2.0+
@@ -383,10 +498,12 @@
   become: false
   tasks:
     - name: Check all nodes are Ready
-      shell: kubectl get nodes --no-headers | awk '{print $2}' | grep -v Ready | wc -l
+      shell: |
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{" "}{range .status.conditions[?(@.type=="Ready")]}{.status}{"\n"}{end}{end}' |
+        awk '$2 != "True" { count++ } END { print count + 0 }'
       register: not_ready_final
       changed_when: false
-      failed_when: not_ready_final.stdout != "0"
+      failed_when: (not_ready_final.stdout | int) != 0
 
     - name: Display final cluster state
       command: kubectl get nodes -o wide
@@ -417,8 +534,8 @@
           - "{{ final_state.stdout }}"
           - "=========================================="
           - ""
-          - "🚀 Теперь можно обновлять Kubernetes до 1.35!"
+          - "🚀 Теперь можно обновлять Kubernetes до {{ k8s_target }}!"
           - ""
           - "Следующий шаг:"
-          - "ansible-playbook -i inventory.ini k8s-upgrade-fixed.yml"
+          - "ansible-playbook playbooks/k8s-upgrade-1.36.yml"
           - "=========================================="

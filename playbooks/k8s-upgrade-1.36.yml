@@ -1,6 +1,7 @@
 ---
 # ===================== 0) PRECHECKS: базовые проверки с первого мастера =====================
 - name: Prechecks (kubectl доступ)
+  any_errors_fatal: true
   hosts: masters[0]
   gather_facts: false
   become: false
@@ -108,6 +109,7 @@
 
 # ============ 1) (ОПЦИОНАЛЬНО) автодетект k8s_node_name по InternalIP ============
 - name: Autodetect k8s_node_name by InternalIP (если нужно)
+  any_errors_fatal: true
   hosts: "masters:workers"
   gather_facts: false
   become: false
@@ -138,6 +140,7 @@
 
 # ======= 2) Настроить APT-репозиторий Kubernetes (minor-pinned) на всех нодах =======
 - name: Configure Kubernetes apt repo on all nodes
+  any_errors_fatal: true
   hosts: "masters:workers"
   become: true
   pre_tasks:
@@ -183,6 +186,7 @@
 # === 3) Привести containerd в рекомендуемое состояние (CRI, SystemdCgroup, pause) ===
 # === + Проверки для Kubernetes 1.35+ (cgroup v2, containerd 2.0+) ===
 - name: Ensure containerd is ready for Kubernetes
+  any_errors_fatal: true
   hosts: "masters:workers"
   become: true
   handlers:
@@ -301,6 +305,7 @@
         
 # ================= 4) Апгрейд CONTROL-PLANE (по одной ноде) =================
 - name: Upgrade control-plane nodes (serial=1)
+  any_errors_fatal: true
   hosts: masters
   serial: 1
   become: true
@@ -336,7 +341,7 @@
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
     - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubeadm_1.37.1-1.1_amd64.deb"
 
     - name: Verify kubeadm version
       command: kubeadm version -o short
@@ -367,9 +372,11 @@
       command: kubeadm upgrade apply {{ k8s_target }} -y
       when: inventory_hostname == groups['masters'][0]
       register: kubeadm_upgrade_apply
-      failed_when: 
-        - kubeadm_upgrade_apply.rc != 0
-        - "'rolled back' not in kubeadm_upgrade_apply.stdout"
+    - name: kubeadm upgrade apply (first master with -y flag)
+      command: kubeadm upgrade apply {{ k8s_target }} -y
+      when: inventory_hostname == groups['masters'][0]
+      register: kubeadm_upgrade_apply
+      failed_when: kubeadm_upgrade_apply.rc != 0
       changed_when: kubeadm_upgrade_apply.rc == 0
       
    
@@ -381,7 +388,7 @@
       changed_when: kubeadm_upgrade_node.rc == 0
 
     - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubelet_1.37.1-1.1_amd64.deb /tmp/kubectl_1.37.1-1.1_amd64.deb"
 
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
@@ -433,6 +440,7 @@
 
 # =================== 5) Апгрейд WORKER-нод (по одной) ===================
 - name: Upgrade worker nodes (serial=1)
+  any_errors_fatal: true
   hosts: workers
   serial: 1
   become: true
@@ -468,7 +476,7 @@
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
     - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubeadm_1.37.1-1.1_amd64.deb"
 
     - name: kubeadm upgrade node (workers)
       command: kubeadm upgrade node
@@ -476,7 +484,7 @@
       changed_when: kubeadm_node_upgrade.rc == 0
 
     - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubelet_1.37.1-1.1_amd64.deb"
     
     
 
@@ -536,6 +544,7 @@
 
 # =================== 6) ФИНАЛЬНЫЕ ПРОВЕРКИ ===================
 - name: Final cluster health verification
+  any_errors_fatal: true
   hosts: masters[0]
   gather_facts: false
   become: false
