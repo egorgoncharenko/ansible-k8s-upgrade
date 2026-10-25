@@ -336,7 +336,7 @@
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
     - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubeadm_1.37.1-1.1_amd64.deb"
 
     - name: Verify kubeadm version
       command: kubeadm version -o short
@@ -381,7 +381,7 @@
       changed_when: kubeadm_upgrade_node.rc == 0
 
     - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubelet_1.37.1-1.1_amd64.deb /tmp/kubectl_1.37.1-1.1_amd64.deb"
 
     - name: Hold kube packages
       shell: "apt-mark hold kubeadm kubelet kubectl"
@@ -468,7 +468,7 @@
       shell: "apt-mark unhold kubeadm kubelet kubectl || true"
 
     - name: Install kubeadm {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubeadm_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubeadm_1.37.1-1.1_amd64.deb"
 
     - name: kubeadm upgrade node (workers)
       command: kubeadm upgrade node
@@ -476,7 +476,7 @@
       changed_when: kubeadm_node_upgrade.rc == 0
 
     - name: Install kubelet/kubectl {{ k8s_target }} from local deb
-      shell: "dpkg -i /tmp/kubelet_1.36.1-1.1_amd64.deb /tmp/kubectl_1.36.1-1.1_amd64.deb"
+      shell: "dpkg -i /tmp/kubelet_1.37.1-1.1_amd64.deb"
     
     
 
